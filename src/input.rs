@@ -127,33 +127,36 @@ pub struct NetInput {
 }
 
 /// A cursor over a flat stream; running off the end is a malformed stream, never a panic.
-struct Stream<'a> {
+pub(crate) struct Stream<'a> {
     v: &'a [i64],
     at: usize,
 }
 
-impl Stream<'_> {
-    fn next(&mut self) -> Result<i64, String> {
+impl<'a> Stream<'a> {
+    pub(crate) fn new(v: &'a [i64]) -> Stream<'a> {
+        Stream { v, at: 0 }
+    }
+    pub(crate) fn next(&mut self) -> Result<i64, String> {
         let x = *self.v.get(self.at).ok_or_else(|| format!("stream ends at {}", self.at))?;
         self.at += 1;
         Ok(x)
     }
-    fn int(&mut self) -> Result<i32, String> {
+    pub(crate) fn int(&mut self) -> Result<i32, String> {
         let x = self.next()?;
         i32::try_from(x).map_err(|_| format!("value {x} out of range at {}", self.at - 1))
     }
-    fn count(&mut self) -> Result<usize, String> {
+    pub(crate) fn count(&mut self) -> Result<usize, String> {
         let x = self.next()?;
         usize::try_from(x).map_err(|_| format!("count {x} at {}", self.at - 1))
     }
-    fn flag(&mut self) -> Result<bool, String> {
+    pub(crate) fn flag(&mut self) -> Result<bool, String> {
         Ok(self.next()? != 0)
     }
-    fn layer(&mut self) -> Result<Option<i32>, String> {
+    pub(crate) fn layer(&mut self) -> Result<Option<i32>, String> {
         let x = self.int()?;
         Ok((x >= 0).then_some(x))
     }
-    fn rect(&mut self) -> Result<Rect, String> {
+    pub(crate) fn rect(&mut self) -> Result<Rect, String> {
         Ok(Rect { xl: self.int()?, yl: self.int()?, xh: self.int()?, yh: self.int()? })
     }
     fn via_shapes(&mut self) -> Result<Vec<ViaShape>, String> {
@@ -166,7 +169,7 @@ impl Stream<'_> {
         let rect = self.rect()?;
         Ok(Geom { is_via, layer, rect, via_shapes: self.via_shapes()? })
     }
-    fn done(&self) -> Result<(), String> {
+    pub(crate) fn done(&self) -> Result<(), String> {
         if self.at == self.v.len() {
             Ok(())
         } else {

@@ -49,7 +49,7 @@ EXIT STATUS:
   3  refused — this build does not implement the command yet
 ";
 
-/// The commands this engine will answer. Each is refused (exit 3) until its stage is built.
+/// The commands this engine will answer. `check` is built; the others refuse (exit 3).
 pub const COMMANDS: &[&str] = &["check", "run", "write-spice"];
 
 const DESCRIBE: &str = r#"{
@@ -58,7 +58,9 @@ const DESCRIBE: &str = r#"{
   "summary": "Power-grid analysis on the design database: connectivity check, static IR drop, per-node voltages, SPICE export.",
   "maturity": "discovered",
   "provenance_limitations": [
-    "No command is implemented yet: every command refuses with exit 3."
+    "check: the error file (-error_file) is not written yet.",
+    "check refuses (exit 3) on an octilinear special wire of another net, a pin layer mixing a polygon off the Manhattan grid with other metal, and an off-grid obstruction polygon.",
+    "run and write-spice refuse with exit 3."
   ],
   "invocation": { "args_template": ["check"], "emits_json": true },
   "inputs": { "type": "object", "properties": {} },
@@ -105,9 +107,9 @@ fn usage_error(msg: &str) -> ExitCode {
     ExitCode::from(2)
 }
 
-/// `check`: build the net's network, then check it — block terminals, opens. The short check is
-/// not built yet, so a network that gets that far still ends in a refusal (exit 3), never in a
-/// pass; what was found before it is printed all the same.
+/// `check`: build the net's network, then check it in the check's order — block terminals, opens,
+/// shorts — and report connected (exit 0) or failed (exit 1). A short the walk cannot measure (an
+/// octilinear wire, a skewed master polygon) refuses (exit 3) rather than pass it over.
 fn check(args: &[String]) -> ExitCode {
     let (mut design, mut net, mut dump_dir) = (None, None, None);
     let (mut floorplanning, mut stats, mut require_bterm) = (false, false, true);
@@ -182,12 +184,32 @@ fn check(args: &[String]) -> ExitCode {
             return refuse("an open check from an unconnected start node");
         }
     };
+    let mut connected = true;
     if !vyges_psm::check::is_connected(&network, &visited) {
         for l in vyges_psm::check::report_unconnected_nodes(&network, &net_input, &visited) {
             println!("{l}");
         }
+        connected = false;
     }
-    refuse("check's short check")
+    let shorts = vyges_psm::read::short_inputs(&db, &net).and_then(|si| vyges_psm::short::check_short(&network, &si, !floorplanning));
+    let (shorts, stopped) = match shorts {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("vyges-psm: the short check cannot measure {e}");
+            return refuse("this short check");
+        }
+    };
+    for l in vyges_psm::short::report_shorts(&network, &net, &shorts, stopped) {
+        println!("{l}");
+    }
+    if !shorts.is_empty() {
+        connected = false;
+    }
+    if !connected {
+        return connectivity_failed(&net);
+    }
+    println!("[INFO PSM-0040] All shapes on net {net} are connected.");
+    ExitCode::SUCCESS
 }
 
 fn connectivity_failed(net: &str) -> ExitCode {
