@@ -3,3 +3,9 @@
 //!
 //! Stages are added here one at a time, each named after the step it performs and kept in the order
 //! the command runs them.
+
+pub mod check;
+pub mod input;
+pub mod network;
+#[cfg(feature = "odb")]
+pub mod read;

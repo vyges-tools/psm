@@ -14,11 +14,33 @@ serde_json = "1"
 # The causal trail. ⚠️ `default-features = false` as in the other engines: the trail is
 # structured output on stderr, not a logging framework this engine gets to choose.
 vyges-events = { git = "https://github.com/vyges-tools/events", branch = "main", default-features = false }
+# The design database. Optional so the network code builds and tests without it; ON by default so a
+# plain `cargo test` covers the read too.
+vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main", optional = true }
+# Manhattan polygon sets (merging, slicing into rectangles) and the packed R-tree with its nearest
+# query: the router's transcriptions, geometry only (no database, no threads).
+vyges-drt = { git = "https://github.com/vyges-tools/drt", branch = "main", default-features = false }
+
+[features]
+default = ["odb"]
+odb = ["dep:vyges-opendb"]
 
 [[bin]]
 name = "vyges-psm"
 path = "src/main.rs"
+required-features = ["odb"]
 
 [lib]
 name = "vyges_psm"
 path = "src/lib.rs"
+
+# Local development against the sibling checkouts. Patches are only honored from the root
+# manifest, so this is a no-op for downstream consumers pulling us by git.
+[patch."https://github.com/vyges-tools/opendb.git"]
+vyges-opendb = { path = "../vyges-tools-opendb" }
+
+[patch."https://github.com/vyges-tools/opendb-lib.git"]
+vyges-opendb-lib = { path = "../vyges-tools-opendb-lib" }
+
+[patch."https://github.com/vyges-tools/drt"]
+vyges-drt = { path = "../vyges-tools-drt" }

@@ -19,7 +19,9 @@ const USAGE: &str = "\
 vyges loom psm — power-grid analysis on the design database: connectivity check, static IR drop, per-node voltages, SPICE export
 
 USAGE:
-  vyges loom psm check        <design.odb> <job>  every power/ground shape and instance pin reaches a supply
+  vyges loom psm check        <design.odb> --net NET [--floorplanning] [--dont-require-terminals]
+                                [--dump-dir DIR] [--stats]
+                                                  every power/ground shape and instance pin reaches a supply
   vyges loom psm run          <design.odb> <job>  static IR drop: per-node voltages, worst and average drop
   vyges loom psm write-spice  <design.odb> <job>  write the power grid as a SPICE netlist
   vyges loom psm --describe
@@ -27,6 +29,11 @@ USAGE:
   vyges loom psm --version
 
 OPTIONS:
+  --net NET             the supply net to analyse
+  --floorplanning       check: only FIXED instances count (the grid before placement)
+  --dont-require-terminals  check: a net without a placed block terminal is not an error
+  --dump-dir DIR        write the network after each construction stage (psm_<stage>.txt) to DIR
+  --stats               print the network's shape, node and connection counts
   -o FILE               write the report (or the output database) to FILE
   --json                machine-readable output instead of the text report
   -q, --quiet           suppress non-essential output
@@ -84,12 +91,108 @@ fn main() -> ExitCode {
             println!("{DESCRIBE}");
             ExitCode::SUCCESS
         }
+        Some("check") => check(&args[1..]),
         Some(cmd) if COMMANDS.contains(&cmd) => refuse(cmd),
         Some(other) => {
             eprintln!("vyges-psm: unknown command `{other}`\n\n{USAGE}");
             ExitCode::from(2)
         }
     }
+}
+
+fn usage_error(msg: &str) -> ExitCode {
+    eprintln!("vyges-psm: {msg}\n\n{USAGE}");
+    ExitCode::from(2)
+}
+
+/// `check`: build the net's network, then check it — block terminals, opens. The short check is
+/// not built yet, so a network that gets that far still ends in a refusal (exit 3), never in a
+/// pass; what was found before it is printed all the same.
+fn check(args: &[String]) -> ExitCode {
+    let (mut design, mut net, mut dump_dir) = (None, None, None);
+    let (mut floorplanning, mut stats, mut require_bterm) = (false, false, true);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--net" => match it.next() {
+                Some(v) => net = Some(v.clone()),
+                None => return usage_error("--net needs a net name"),
+            },
+            "--dump-dir" => match it.next() {
+                Some(v) => dump_dir = Some(std::path::PathBuf::from(v)),
+                None => return usage_error("--dump-dir needs a directory"),
+            },
+            "--floorplanning" => floorplanning = true,
+            "--stats" => stats = true,
+            "--dont-require-terminals" => require_bterm = false,
+            v if v.starts_with('-') => return usage_error(&format!("unknown option `{v}`")),
+            v if design.is_none() => design = Some(v.to_string()),
+            v => return usage_error(&format!("unexpected argument `{v}`")),
+        }
+    }
+    let (Some(design), Some(net)) = (design, net) else { return usage_error("check needs <design.odb> and --net") };
+    let db = match vyges_opendb::Db::open(&design) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("vyges-psm: cannot read {design}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let input = match vyges_psm::read::tech(&db).and_then(|t| vyges_psm::read::net(&db, &net).map(|n| (t, n))) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("vyges-psm: cannot read net {net}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let (tech, net_input) = input;
+    let dump: Option<vyges_psm::network::DumpFn> = dump_dir.map(|dir| {
+        Box::new(move |stage: &str, n: &vyges_psm::network::Network| {
+            let mut text = n.dump_lines().join("\n");
+            text.push('\n');
+            if let Err(e) = std::fs::write(dir.join(format!("psm_{stage}.txt")), text) {
+                eprintln!("vyges-psm: cannot write the {stage} dump: {e}");
+            }
+        }) as vyges_psm::network::DumpFn
+    });
+    let (network, log) = match vyges_psm::network::Network::build(&tech, &net_input, floorplanning, dump) {
+        Ok(x) => x,
+        Err(e) => {
+            println!("[ERROR PSM-0087] {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if log.empty {
+        println!("[WARNING PSM-0086] Net {net} is empty.");
+        return connectivity_failed(&net);
+    }
+    if stats {
+        for l in network.stats_lines() {
+            println!("{l}");
+        }
+    }
+    if require_bterm && !vyges_psm::check::check_bterms(&net_input) {
+        println!("{}", vyges_psm::check::missing_bterm_message(&net_input));
+        return ExitCode::from(1);
+    }
+    let visited = match vyges_psm::check::check_open(&network) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("vyges-psm: the open check cannot start: {e}");
+            return refuse("an open check from an unconnected start node");
+        }
+    };
+    if !vyges_psm::check::is_connected(&network, &visited) {
+        for l in vyges_psm::check::report_unconnected_nodes(&network, &net_input, &visited) {
+            println!("{l}");
+        }
+    }
+    refuse("check's short check")
+}
+
+fn connectivity_failed(net: &str) -> ExitCode {
+    println!("[ERROR PSM-0069] Check connectivity failed on {net}.");
+    ExitCode::from(1)
 }
 
 #[cfg(test)]
