@@ -10,6 +10,7 @@ use vyges_drt::rtree::PackedRTree;
 
 use crate::input::{NetInput, Rect};
 use crate::network::{Network, NodeId, NodeKind};
+use crate::short::{Short, Source};
 
 /// Some pin of some block terminal of the net is placed.
 pub fn check_bterms(net: &NetInput) -> bool {
@@ -58,9 +59,21 @@ fn um(v: i32, dbu: f64) -> String {
     format!("{:4.3}", f64::from(v) / dbu)
 }
 
+/// What an open network reports, and the markers it records.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OpenReport {
+    pub lines: Vec<String>,
+    /// Some layer node is unreached: the "unconnected shape" marker group is made (even empty).
+    pub shape_group: bool,
+    /// Each reported shape: layer index, rect.
+    pub shapes: Vec<(usize, Rect)>,
+    /// The unreached instance terminals, by name (their instances get the markers).
+    pub iterms: Vec<String>,
+}
+
 /// What an open network reports: each shape holding an unreached node (once, in node order and
 /// the layer's shape-tree order within a node), then each unreached instance terminal.
-pub fn report_unconnected_nodes(nw: &Network, net: &NetInput, visited: &HashSet<NodeId>) -> Vec<String> {
+pub fn report_unconnected_nodes(nw: &Network, net: &NetInput, visited: &HashSet<NodeId>) -> OpenReport {
     let dbu = f64::from(nw.tech.dbus);
     let mut nodes: Vec<NodeId> = nw.nodes.values().flatten().copied().filter(|n| !visited.contains(n)).collect();
     nodes.sort_by(|a, b| nw.compare(*a, *b));
@@ -68,9 +81,9 @@ pub fn report_unconnected_nodes(nw: &Network, net: &NetInput, visited: &HashSet<
     let mut iterms: Vec<NodeId> = nw.iterm_nodes.iter().copied().filter(|n| !visited.contains(n)).collect();
     iterms.sort_by(|a, b| nw.compare(*a, *b));
     iterms.dedup_by(|a, b| nw.compare(*a, *b).is_eq());
-    let mut out = Vec::new();
+    let mut rep = OpenReport { shape_group: !nodes.is_empty(), ..OpenReport::default() };
     if nodes.is_empty() && iterms.is_empty() {
-        return out;
+        return rep;
     }
     let mut trees: HashMap<usize, PackedRTree<(Rect, usize)>> = HashMap::new();
     let mut reported: HashSet<(usize, usize)> = HashSet::new();
@@ -86,7 +99,8 @@ pub fn report_unconnected_nodes(nw: &Network, net: &NetInput, visited: &HashSet<
             if !reported.insert((node.li, id)) {
                 continue;
             }
-            out.push(format!(
+            rep.shapes.push((node.li, rect));
+            rep.lines.push(format!(
                 "[WARNING PSM-0038] Unconnected shape on net {} at ({}um, {}um) - ({}um, {}um), layer: {}.",
                 net.name,
                 um(rect.xl, dbu),
@@ -100,12 +114,88 @@ pub fn report_unconnected_nodes(nw: &Network, net: &NetInput, visited: &HashSet<
     for &n in &iterms {
         let node = &nw.arena[n];
         let NodeKind::ITerm { iterm, .. } = node.kind else { continue };
-        out.push(format!(
+        rep.iterms.push(net.iterms[iterm].name.clone());
+        rep.lines.push(format!(
             "[WARNING PSM-0039] Unconnected instance {} at location ({}um, {}um).",
             net.iterms[iterm].name,
             um(node.pt.0, dbu),
             um(node.pt.1, dbu)
         ));
     }
-    out
+    rep
+}
+
+/// The error file's marker stream (layout at the opendb shim, `psm_write_error_file`) and the
+/// names it indexes. `Err` for a short whose overlap is not one rectangle: its marker is a polygon
+/// whose point order this build does not reproduce.
+pub fn error_file_stream(nw: &Network, open: &OpenReport, shorts: &[Short]) -> Result<(Vec<i64>, Vec<String>), String> {
+    let mut v = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut name = |n: &str| -> i64 {
+        names.push(n.to_string());
+        names.len() as i64 - 1
+    };
+    let rect = |v: &mut Vec<i64>, r: &Rect| v.extend([r.xl, r.yl, r.xh, r.yh].map(i64::from));
+    v.push(i64::from(open.shape_group));
+    v.push(open.shapes.len() as i64);
+    for (li, r) in &open.shapes {
+        v.push(i64::from(nw.tech.layers[*li].number));
+        rect(&mut v, r);
+    }
+    v.push(i64::from(!open.iterms.is_empty()));
+    v.push(open.iterms.len() as i64);
+    for it in &open.iterms {
+        v.push(name(it));
+    }
+    v.push(shorts.len() as i64);
+    for sh in shorts {
+        if !sh.rect {
+            return Err(format!("a short to {} whose overlap is not one rectangle", sh.to));
+        }
+        v.push(i64::from(nw.tech.layers[sh.li].number));
+        rect(&mut v, &sh.bbox);
+        v.push(sh.sources.len() as i64);
+        for src in &sh.sources {
+            let (kind, value) = match src {
+                Source::Net(n) => (0, name(n)),
+                Source::BTerm(n) => (1, name(n)),
+                Source::ITerm(n) => (2, name(n)),
+                Source::Inst(n) => (3, name(n)),
+                Source::Obstruction(i) => (4, *i as i64),
+            };
+            v.extend([kind, value]);
+        }
+    }
+    Ok((v, names))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::input::{Dir, Layer, SBox, Tech};
+
+    fn network() -> Network<'static> {
+        let layer = |id: u32, number: i32, name: &str| Layer { id, number, name: name.into(), routing_level: 1, pitch: 200, dir: Dir::Horizontal, backside: false, upper: None, cut_classes: vec![] };
+        let tech: &'static Tech = Box::leak(Box::new(Tech { dbus: 1000, front_base: Some(3), back_base: None, layers: vec![layer(1, 3, "m1")] }));
+        let net = NetInput { name: "VDD".into(), supply: true, swires: vec![vec![SBox::Wire { layer: 3, rect: Rect { xl: 0, yl: 0, xh: 100, yh: 10 } }]], iterms: vec![], bterms: vec![] };
+        Network::build(tech, &net, false, None).unwrap().0
+    }
+
+    // The error file's stream: the shape group (made, count, layer NUMBER + rect each), the
+    // instance group (made, terminal names), then each short with its sources; a short whose
+    // overlap is not its box cannot be written.
+    #[test]
+    fn the_error_file_stream_in_layout_order() {
+        let nw = network();
+        let r = Rect { xl: 1, yl: 2, xh: 3, yh: 4 };
+        let open = OpenReport { lines: vec![], shape_group: true, shapes: vec![(0, r)], iterms: vec!["u1/VDD".into()] };
+        let short = Short { li: 0, bbox: r, rect: true, to: "x".into(), sources: vec![Source::ITerm("u2/A".into()), Source::Net("n1".into()), Source::Obstruction(7)] };
+        let (v, names) = error_file_stream(&nw, &open, std::slice::from_ref(&short)).unwrap();
+        assert_eq!(v, vec![1, 1, 3, 1, 2, 3, 4, 1, 1, 0, 1, 3, 1, 2, 3, 4, 3, 2, 1, 0, 2, 4, 7]);
+        assert_eq!(names, vec!["u1/VDD", "u2/A", "n1"]);
+        // Nothing found: both groups unmade, no shorts.
+        assert_eq!(error_file_stream(&nw, &OpenReport::default(), &[]).unwrap().0, vec![0, 0, 0, 0, 0]);
+        let polygon = Short { rect: false, ..short };
+        assert!(error_file_stream(&nw, &open, &[polygon]).is_err());
+    }
 }

@@ -20,7 +20,7 @@ vyges loom psm — power-grid analysis on the design database: connectivity chec
 
 USAGE:
   vyges loom psm check        <design.odb> --net NET [--floorplanning] [--dont-require-terminals]
-                                [--dump-dir DIR] [--stats]
+                                [--error-file FILE] [--dump-dir DIR] [--stats]
                                                   every power/ground shape and instance pin reaches a supply
   vyges loom psm run          <design.odb> <job>  static IR drop: per-node voltages, worst and average drop
   vyges loom psm write-spice  <design.odb> <job>  write the power grid as a SPICE netlist
@@ -32,6 +32,7 @@ OPTIONS:
   --net NET             the supply net to analyse
   --floorplanning       check: only FIXED instances count (the grid before placement)
   --dont-require-terminals  check: a net without a placed block terminal is not an error
+  --error-file FILE     check: write the net's unconnected and shorted shapes as a marker report
   --dump-dir DIR        write the network after each construction stage (psm_<stage>.txt) to DIR
   --stats               print the network's shape, node and connection counts
   -o FILE               write the report (or the output database) to FILE
@@ -58,7 +59,7 @@ const DESCRIBE: &str = r#"{
   "summary": "Power-grid analysis on the design database: connectivity check, static IR drop, per-node voltages, SPICE export.",
   "maturity": "discovered",
   "provenance_limitations": [
-    "check: the error file (-error_file) is not written yet.",
+    "check: an error file holding a short whose overlap is not one rectangle refuses (exit 3).",
     "check refuses (exit 3) on an octilinear special wire of another net, a pin layer mixing a polygon off the Manhattan grid with other metal, and an off-grid obstruction polygon.",
     "run and write-spice refuse with exit 3."
   ],
@@ -111,7 +112,7 @@ fn usage_error(msg: &str) -> ExitCode {
 /// shorts — and report connected (exit 0) or failed (exit 1). A short the walk cannot measure (an
 /// octilinear wire, a skewed master polygon) refuses (exit 3) rather than pass it over.
 fn check(args: &[String]) -> ExitCode {
-    let (mut design, mut net, mut dump_dir) = (None, None, None);
+    let (mut design, mut net, mut dump_dir, mut error_file) = (None, None, None, None);
     let (mut floorplanning, mut stats, mut require_bterm) = (false, false, true);
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -119,6 +120,10 @@ fn check(args: &[String]) -> ExitCode {
             "--net" => match it.next() {
                 Some(v) => net = Some(v.clone()),
                 None => return usage_error("--net needs a net name"),
+            },
+            "--error-file" => match it.next() {
+                Some(v) => error_file = Some(v.clone()),
+                None => return usage_error("--error-file needs a file"),
             },
             "--dump-dir" => match it.next() {
                 Some(v) => dump_dir = Some(std::path::PathBuf::from(v)),
@@ -166,6 +171,9 @@ fn check(args: &[String]) -> ExitCode {
     };
     if log.empty {
         println!("[WARNING PSM-0086] Net {net} is empty.");
+        if let Some(code) = write_error_file(&db, &net, error_file.as_deref(), &network, &Default::default(), &[]) {
+            return code;
+        }
         return connectivity_failed(&net);
     }
     if stats {
@@ -185,8 +193,10 @@ fn check(args: &[String]) -> ExitCode {
         }
     };
     let mut connected = true;
+    let mut open = vyges_psm::check::OpenReport::default();
     if !vyges_psm::check::is_connected(&network, &visited) {
-        for l in vyges_psm::check::report_unconnected_nodes(&network, &net_input, &visited) {
+        open = vyges_psm::check::report_unconnected_nodes(&network, &net_input, &visited);
+        for l in &open.lines {
             println!("{l}");
         }
         connected = false;
@@ -205,11 +215,39 @@ fn check(args: &[String]) -> ExitCode {
     if !shorts.is_empty() {
         connected = false;
     }
+    if let Some(code) = write_error_file(&db, &net, error_file.as_deref(), &network, &open, &shorts) {
+        return code;
+    }
     if !connected {
         return connectivity_failed(&net);
     }
     println!("[INFO PSM-0040] All shapes on net {net} are connected.");
     ExitCode::SUCCESS
+}
+
+/// The error file, when asked for: the check's markers recorded and the net's group written. `Some`
+/// exit code when it could not be.
+fn write_error_file(
+    db: &vyges_opendb::Db,
+    net: &str,
+    path: Option<&str>,
+    network: &vyges_psm::network::Network,
+    open: &vyges_psm::check::OpenReport,
+    shorts: &[vyges_psm::short::Short],
+) -> Option<ExitCode> {
+    let path = path?;
+    let (v, names) = match vyges_psm::check::error_file_stream(network, open, shorts) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("vyges-psm: the error file cannot hold {e}");
+            return Some(refuse("this error file"));
+        }
+    };
+    if let Err(e) = db.psm_write_error_file(net, &v, &names, path) {
+        eprintln!("vyges-psm: cannot write the error file {path}: {e}");
+        return Some(ExitCode::from(2));
+    }
+    None
 }
 
 fn connectivity_failed(net: &str) -> ExitCode {

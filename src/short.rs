@@ -366,9 +366,10 @@ fn convex(pts: &[(i32, i32)]) -> bool {
     n >= 3
 }
 
-/// A convex polygon cut to a rectangle: the bounding box of what is left, when it has area.
-/// `Err` when a corner of the cut does not land on the grid (a slope other than 45 degrees).
-fn clip_convex(pts: &[(i32, i32)], r: &Rect) -> Result<Option<Rect>, String> {
+/// A convex polygon cut to a rectangle: the bounding box of what is left, when it has area, and
+/// whether what is left is that box. `Err` when a corner of the cut does not land on the grid (a
+/// slope other than 45 degrees).
+fn clip_convex(pts: &[(i32, i32)], r: &Rect) -> Result<Option<(Rect, bool)>, String> {
     let mut poly: Vec<(f64, f64)> = pts.iter().map(|p| (f64::from(p.0), f64::from(p.1))).collect();
     let planes: [(usize, f64, bool); 4] = [(0, f64::from(r.xl), true), (0, f64::from(r.xh), false), (1, f64::from(r.yl), true), (1, f64::from(r.yh), false)];
     for (axis, v, keep_above) in planes {
@@ -402,7 +403,9 @@ fn clip_convex(pts: &[(i32, i32)], r: &Rect) -> Result<Option<Rect>, String> {
     }
     let xs = poly.iter().map(|p| p.0 as i32);
     let ys = poly.iter().map(|p| p.1 as i32);
-    Ok(Some(Rect { xl: xs.clone().min().unwrap(), yl: ys.clone().min().unwrap(), xh: xs.max().unwrap(), yh: ys.max().unwrap() }))
+    let b = Rect { xl: xs.clone().min().unwrap(), yl: ys.clone().min().unwrap(), xh: xs.max().unwrap(), yh: ys.max().unwrap() };
+    let boxed = area.abs() / 2.0 == f64::from(b.dx()) * f64::from(b.dy());
+    Ok(Some((b, boxed)))
 }
 
 /// One extracted piece of a master's layer: Manhattan slices, or a single convex polygon.
@@ -427,12 +430,33 @@ fn bloat(r: &Rect, d: i32) -> Rect {
 
 // ---- the check -----------------------------------------------------------------------------------
 
-/// One short: the layer, the overlap's bounding box, and what the net is shorted to.
+/// A database object a short's marker names besides the checked net.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    Net(String),
+    BTerm(String),
+    ITerm(String),
+    Inst(String),
+    /// By its position among the block's obstructions.
+    Obstruction(usize),
+}
+
+/// What a short is to: the words the report uses and the objects the marker names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Other {
+    pub to: String,
+    pub sources: Vec<Source>,
+}
+
+/// One short: the layer, the overlap's bounding box (`rect` when the overlap IS that box), and what
+/// the net is shorted to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Short {
     pub li: usize,
     pub bbox: Rect,
+    pub rect: bool,
     pub to: String,
+    pub sources: Vec<Source>,
 }
 
 /// A layer as a master's per-layer maps key it: (database id, which orders them; number).
@@ -456,24 +480,24 @@ impl Walk<'_, '_> {
     }
 
     /// Recorded, unless the list is full: then the walk stops.
-    fn add(&mut self, li: usize, bbox: Rect, to: &str) -> bool {
+    fn add(&mut self, li: usize, (bbox, rect): (Rect, bool), other: &Other) -> bool {
         if self.shorts.len() >= MAX_SHORT_ENTRIES {
             return false;
         }
-        self.shorts.push(Short { li, bbox, to: to.to_string() });
+        self.shorts.push(Short { li, bbox, rect, to: other.to.clone(), sources: other.sources.clone() });
         true
     }
 
     /// The net's shapes a rectangle overlaps (touching is not a short): each overlap.
-    fn short_rect(&self, layer: Option<i32>, r: &Rect) -> (usize, Vec<Rect>) {
+    fn short_rect(&self, layer: Option<i32>, r: &Rect) -> (usize, Vec<(Rect, bool)>) {
         let Some(li) = layer.and_then(|l| self.li(l)) else { return (0, vec![]) };
         let Some(tree) = self.trees.get(&li) else { return (li, vec![]) };
-        (li, tree.query(r).into_iter().filter(|e| overlaps(&e.1, r)).map(|e| intersect(&e.1, r)).collect())
+        (li, tree.query(r).into_iter().filter(|e| overlaps(&e.1, r)).map(|e| (intersect(&e.1, r), true)).collect())
     }
 
     /// The net's shapes a region overlaps: per shape, every piece of the overlap. With
     /// `require_overlap` an overlap that does not reach into the shape is not one.
-    fn short_region(&self, li: usize, rs: &[Rect], require_overlap: bool) -> Vec<Rect> {
+    fn short_region(&self, li: usize, rs: &[Rect], require_overlap: bool) -> Vec<(Rect, bool)> {
         let Some(tree) = self.trees.get(&li) else { return vec![] };
         let mut out = Vec::new();
         for e in tree.query(&bbox(rs)) {
@@ -485,13 +509,13 @@ impl Walk<'_, '_> {
             if require_overlap && !overlaps(&shape, &bbox(&overlap)) {
                 continue;
             }
-            out.extend(pieces(&overlap).iter().map(|p| bbox(p)));
+            out.extend(pieces(&overlap).iter().map(|p| (bbox(p), p.len() == 1)));
         }
         out
     }
 
     /// [`Self::short_region`] for either kind of piece.
-    fn short_piece(&self, li: usize, p: &Piece, require_overlap: bool) -> Result<Vec<Rect>, String> {
+    fn short_piece(&self, li: usize, p: &Piece, require_overlap: bool) -> Result<Vec<(Rect, bool)>, String> {
         let pts = match p {
             Piece::Rects(rs) => return Ok(self.short_region(li, rs, require_overlap)),
             Piece::Convex(pts) => pts,
@@ -506,7 +530,7 @@ impl Walk<'_, '_> {
         let mut out = Vec::new();
         for e in tree.query(&bb) {
             let Some(o) = clip_convex(pts, &e.1)? else { continue };
-            if require_overlap && !overlaps(&e.1, &o) {
+            if require_overlap && !overlaps(&e.1, &o.0) {
                 continue;
             }
             out.push(o);
@@ -515,7 +539,7 @@ impl Walk<'_, '_> {
     }
 
     /// A box: a via's shapes layer by layer, or the box on its own layer.
-    fn short_box(&mut self, g: &BoxGeom, to: &str) -> bool {
+    fn short_box(&mut self, g: &BoxGeom, to: &Other) -> bool {
         let parts: Vec<(Option<i32>, Rect)> = if g.is_via { g.via.iter().filter(|v| v.0.is_some()).copied().collect() } else { vec![(g.layer, g.rect)] };
         for (layer, r) in parts {
             let (li, found) = self.short_rect(layer, &r);
@@ -625,7 +649,7 @@ pub fn check_short(nw: &Network, si: &ShortInputs, check_placed: bool) -> Result
     let counts = |placed: bool, fixed: bool| if check_placed { placed } else { fixed };
     for net in &si.nets {
         for (bterm, pins) in &net.bterms {
-            let to = format!("terminal {bterm} (net {})", net.name);
+            let to = Other { to: format!("terminal {bterm} (net {})", net.name), sources: vec![Source::BTerm(bterm.clone()), Source::Net(net.name.clone())] };
             for pin in pins.iter().filter(|p| counts(p.placed, p.fixed)) {
                 for g in &pin.boxes {
                     if !w.short_box(g, &to) {
@@ -634,7 +658,7 @@ pub fn check_short(nw: &Network, si: &ShortInputs, check_placed: bool) -> Result
                 }
             }
         }
-        let to = format!("net {}", net.name);
+        let to = Other { to: format!("net {}", net.name), sources: vec![Source::Net(net.name.clone())] };
         for (octilinear, g) in &net.sboxes {
             if *octilinear {
                 return Err(format!("an octilinear special wire on net {}", net.name));
@@ -661,7 +685,9 @@ pub fn check_short(nw: &Network, si: &ShortInputs, check_placed: bool) -> Result
                 std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
                 std::collections::hash_map::Entry::Vacant(e) => e.insert(master_terms(nw, &m.mterms[it.mterm]).map_err(|e| format!("{e} on {}", it.name))?).clone(),
             };
-            let to = format!("terminal {} (net {})", it.name, it.net.as_deref().unwrap_or("unconnected"));
+            let mut sources = vec![Source::ITerm(it.name.clone())];
+            sources.extend(it.net.iter().map(|n| Source::Net(n.clone())));
+            let to = Other { to: format!("terminal {} (net {})", it.name, it.net.as_deref().unwrap_or("unconnected")), sources };
             for (layer, ps) in &t {
                 let Some(li) = w.li(*layer) else { continue };
                 for p in ps {
@@ -677,7 +703,7 @@ pub fn check_short(nw: &Network, si: &ShortInputs, check_placed: bool) -> Result
             std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
             std::collections::hash_map::Entry::Vacant(e) => e.insert(master_obstructions(nw, m).map_err(|e| format!("{e} on {}", inst.name))?).clone(),
         };
-        let to = format!("instance {}", inst.name);
+        let to = Other { to: format!("instance {}", inst.name), sources: vec![Source::Inst(inst.name.clone())] };
         for (layer, ps) in &obs {
             let Some(li) = w.li(*layer) else { continue };
             for p in ps {
@@ -689,11 +715,14 @@ pub fn check_short(nw: &Network, si: &ShortInputs, check_placed: bool) -> Result
             }
         }
     }
-    for obs in si.obstructions.iter().filter(|o| !(o.except_pg || o.slot || o.fill)) {
+    for (i, obs) in si.obstructions.iter().enumerate().filter(|(_, o)| !(o.except_pg || o.slot || o.fill)) {
+        let mut sources = vec![Source::Obstruction(i)];
+        sources.extend(obs.inst.iter().map(|n| Source::Inst(n.clone())));
         let to = match &obs.inst {
             Some(i) => format!("obstruction of {i}"),
             None => "obstruction".to_string(),
         };
+        let to = Other { to, sources };
         let (li, found) = w.short_rect(obs.layer, &obs.rect);
         for o in found {
             if !w.add(li, o, &to) {
@@ -703,6 +732,8 @@ pub fn check_short(nw: &Network, si: &ShortInputs, check_placed: bool) -> Result
     }
     for f in &si.fills {
         let to = if f.mask == 0 { "fill".to_string() } else { format!("fill with mask {}", f.mask) };
+        // The marker cannot name a fill.
+        let to = Other { to, sources: vec![] };
         let (li, found) = w.short_rect(f.layer, &f.rect);
         for o in found {
             if !w.add(li, o, &to) {
@@ -802,7 +833,7 @@ mod tests {
         si.nets = vec![other("A", vec![wire(0, r(2000, 1000, 3000, 2000)), wire(0, r(4000, 500, 5000, 1500)), wire(2, r(0, 0, 100, 100))])];
         let (shorts, stopped) = check_short(&nw, &si, true).unwrap();
         assert!(!stopped);
-        assert_eq!(shorts, vec![Short { li: 0, bbox: r(4000, 500, 5000, 1000), to: "net A".into() }]);
+        assert_eq!(shorts, vec![Short { li: 0, bbox: r(4000, 500, 5000, 1000), rect: true, to: "net A".into(), sources: vec![Source::Net("A".into())] }]);
         let lines = report_shorts(&nw, "VDD", &shorts, stopped);
         assert_eq!(lines, vec!["[WARNING PSM-0043] Shorted shape on net VDD to net A at (4.000um, 0.500um) - (5.000um, 1.000um), layer: m1."]);
     }
@@ -830,6 +861,23 @@ mod tests {
         want.extend(tail);
         assert_eq!(to(true), want);
         assert_eq!(to(false), want);
+        // What each marker names besides the checked net: a block pin its terminal and that
+        // terminal's net, an obstruction itself (by position, the skipped ones counted) and its
+        // instance, a fill nothing.
+        let sources: Vec<Vec<Source>> = check_short(&nw, &si, true).unwrap().0.into_iter().map(|s| s.sources).collect();
+        let net = Source::Net("A".into());
+        assert_eq!(
+            sources,
+            vec![
+                vec![Source::BTerm("a".into()), net.clone()],
+                vec![net.clone()],
+                vec![net],
+                vec![Source::Obstruction(1), Source::Inst("u1".into())],
+                vec![Source::Obstruction(2)],
+                vec![],
+                vec![],
+            ]
+        );
     }
 
     // A full list stops the walk: the shorts kept are the first MAX_SHORT_ENTRIES, and the stop
@@ -934,13 +982,17 @@ mod tests {
         let mut si = inputs();
         si.masters = vec![polygon_master(vec![PolygonGeom { layer: Some(0), pts: octagon() }], vec![])];
         si.insts = vec![InstGeom { offset: (1000, 500), ..inst(vec![iterm("pad/PAD", false, Some("out"), 0, 0)]) }];
-        let s: Vec<Rect> = check_short(&nw, &si, true).unwrap().0.into_iter().map(|s| s.bbox).collect();
-        assert_eq!(s, vec![r(1000, 500, 2000, 1000)]);
+        let s: Vec<(Rect, bool)> = check_short(&nw, &si, true).unwrap().0.into_iter().map(|s| (s.bbox, s.rect)).collect();
+        // Not a rectangle: the cut corners lie on the strap.
+        assert_eq!(s, vec![(r(1000, 500, 2000, 1000), false)]);
         // The strap's corner over the octagon's cut corner: a 45 degree edge from (200, 100) to
         // (300, 0) bounds the part on the strap, so its box starts at x 200, not at the cell edge.
         si.insts[0].offset = (9500, 900);
-        let s: Vec<Rect> = check_short(&nw, &si, true).unwrap().0.into_iter().map(|s| s.bbox).collect();
-        assert_eq!(s, vec![r(9700, 900, 10000, 1000)]);
+        let s: Vec<(Rect, bool)> = check_short(&nw, &si, true).unwrap().0.into_iter().map(|s| (s.bbox, s.rect)).collect();
+        assert_eq!(s, vec![(r(9700, 900, 10000, 1000), false)]);
+        // Across the octagon's straight middle the overlap IS its box; touching it is nothing.
+        assert_eq!(clip_convex(&octagon(), &r(-50, 400, 1050, 600)), Ok(Some((r(0, 400, 1000, 600), true))));
+        assert_eq!(clip_convex(&octagon(), &r(1000, 400, 1100, 600)), Ok(None));
     }
 
     // Such a polygon is only refused where it is measured: on a pin of the net (skipped) it is
@@ -974,7 +1026,11 @@ mod tests {
         let mut si = inputs();
         si.masters = vec![polygon_master(vec![PolygonGeom { layer: Some(0), pts: l }], vec![])];
         si.insts = vec![InstGeom { offset: (1000, 900), ..inst(vec![iterm("u1/A", false, Some("n1"), 0, 0)]) }];
-        let s: Vec<Rect> = check_short(&nw, &si, true).unwrap().0.into_iter().map(|s| s.bbox).collect();
-        assert_eq!(s, vec![r(1000, 900, 1600, 1000)]);
+        let s: Vec<(Rect, bool)> = check_short(&nw, &si, true).unwrap().0.into_iter().map(|s| (s.bbox, s.rect)).collect();
+        assert_eq!(s, vec![(r(1000, 900, 1600, 1000), true)]);
+        // Lower, the L's corner is on the strap: one piece, not its box.
+        si.insts[0].offset = (1000, 700);
+        let s: Vec<(Rect, bool)> = check_short(&nw, &si, true).unwrap().0.into_iter().map(|s| (s.bbox, s.rect)).collect();
+        assert_eq!(s, vec![(r(1000, 700, 1600, 1000), false)]);
     }
 }
