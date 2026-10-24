@@ -1,0 +1,31 @@
+# Build & test on every push to main and on pull requests (plus manual dispatch).
+#
+# 🔴 PUSH-TRIGGERED ON PURPOSE. Our release tooling derives the set of gating workflows from each
+# repo's own `on:` triggers and requires every one green at HEAD, so a repo with no push-triggered
+# workflow is reported as "not gated" — which reads like a pass and is actually "nobody looked".
+#
+# Actions are enabled on this repository when it is made public.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --locked --verbose
+      - name: Test
+        run: cargo test --locked --verbose
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
