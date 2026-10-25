@@ -8,5 +8,6 @@ pub mod check;
 pub mod input;
 pub mod network;
 pub mod short;
+pub mod solve;
 #[cfg(feature = "odb")]
 pub mod read;

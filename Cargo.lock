@@ -500,11 +500,17 @@ dependencies = [
 name = "vyges-psm"
 version = "0.1.45"
 dependencies = [
+ "miniz_oxide",
  "serde_json",
  "vyges-drt",
  "vyges-events",
  "vyges-opendb",
+ "vyges-sta",
 ]
+
+[[package]]
+name = "vyges-sta"
+version = "0.1.45"
 
 [[package]]
 name = "winapi-util"

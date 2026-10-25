@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use vyges_drt::rtree::PackedRTree;
 
 use crate::input::{NetInput, Rect};
-use crate::network::{Network, NodeId, NodeKind};
+use crate::network::{ref_tree, Network, NodeId, NodeKind};
 use crate::short::{Short, Source};
 
 /// Some pin of some block terminal of the net is placed.
@@ -91,7 +91,7 @@ pub fn report_unconnected_nodes(nw: &Network, net: &NetInput, visited: &HashSet<
         let node = &nw.arena[n];
         let tree = trees.entry(node.li).or_insert_with(|| {
             let shapes = nw.shapes.iter().find(|(k, _)| k.li == node.li).map(|(_, v)| v.as_slice()).unwrap_or(&[]);
-            PackedRTree::new(shapes.iter().map(|s| (s.rect, (s.rect, s.id))).collect())
+            ref_tree(shapes.iter().map(|s| (s.rect, (s.rect, s.id))).collect())
         });
         let p = Rect { xl: node.pt.0, yl: node.pt.1, xh: node.pt.0, yh: node.pt.1 };
         for e in tree.query(&p) {

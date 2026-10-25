@@ -15,7 +15,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use vyges_drt::polygon90::Polygon90Set;
-use vyges_drt::rtree::PackedRTree;
+use vyges_drt::rtree::{PackedRTree, StdLib};
 
 use crate::input::{Dir, Geom, NetInput, Rect, SBox, Tech, ViaShape};
 
@@ -115,6 +115,13 @@ fn center(r: &Rect) -> (i32, i32) {
 
 fn max_dxdy(r: &Rect) -> i32 {
     r.dx().max(r.dy())
+}
+
+/// An R-tree packed as the reference packs one: it is built against libstdc++, whose
+/// `nth_element` permutes the packing's slices and whose heap orders a nearest query's pending
+/// branches, so two nodes at the same distance are told apart exactly as there.
+pub fn ref_tree<T>(values: Vec<(Rect, T)>) -> PackedRTree<T> {
+    PackedRTree::new_in(values, StdLib::LibStdCxx)
 }
 
 fn point_rect(p: (i32, i32)) -> Rect {
@@ -249,6 +256,18 @@ impl<'a> Network<'a> {
             if self.compare_opt(a, c.n1) == Ordering::Greater {
                 std::mem::swap(&mut c.n0, &mut c.n1);
             }
+        }
+    }
+
+    /// Two connections in connection order.
+    pub fn conn_order(&self, a: ConnId, b: ConnId) -> Ordering {
+        let (x, y) = (&self.conns[a], &self.conns[b]);
+        if self.conn_less(x, y) {
+            Ordering::Less
+        } else if self.conn_less(y, x) {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
         }
     }
 
@@ -702,7 +721,7 @@ impl<'a> Network<'a> {
         let mut shared = HashSet::new();
         for (k, nodes) in &self.nodes {
             let shapes = self.shapes.get(k).map(Vec::as_slice).unwrap_or(&[]);
-            let tree = PackedRTree::new(shapes.iter().map(|s| (s.rect, ())).collect());
+            let tree = ref_tree(shapes.iter().map(|s| (s.rect, ())).collect());
             for &n in nodes {
                 if tree.query(&point_rect(self.arena[n].pt)).len() > 1 {
                     shared.insert(n);
@@ -722,7 +741,7 @@ impl<'a> Network<'a> {
 
     fn node_tree(&self, k: LayerKey) -> PackedRTree<NodeId> {
         let ids = self.nodes.get(&k).map(Vec::as_slice).unwrap_or(&[]);
-        PackedRTree::new(ids.iter().map(|&n| (point_rect(self.arena[n].pt), n)).collect())
+        ref_tree(ids.iter().map(|&n| (point_rect(self.arena[n].pt), n)).collect())
     }
 
     /// Per shape, nodes closer than half the node pitch merge into one: shared nodes first, then
@@ -773,7 +792,7 @@ impl<'a> Network<'a> {
                 data.push(n);
             }
         }
-        let search = PackedRTree::new(data.iter().enumerate().map(|(i, &n)| (point_rect(self.arena[n].pt), i)).collect());
+        let search = ref_tree(data.iter().enumerate().map(|(i, &n)| (point_rect(self.arena[n].pt), i)).collect());
         let mut used = vec![false; data.len()];
         let mut remove = HashSet::new();
         let radius = min_distance / 2;
@@ -891,7 +910,7 @@ impl<'a> Network<'a> {
 
     fn shape_connect_nodes(&mut self, s: &Shape, layer_tree: &PackedRTree<NodeId>) -> Vec<ConnId> {
         let sorted = self.nodes_on(layer_tree, &s.rect);
-        let tree = PackedRTree::new(sorted.iter().map(|&n| (point_rect(self.arena[n].pt), n)).collect());
+        let tree = ref_tree(sorted.iter().map(|&n| (point_rect(self.arena[n].pt), n)).collect());
         let mut used: HashSet<NodeId> = HashSet::new();
         let mut out = Vec::new();
         for &n in &sorted {
@@ -925,6 +944,14 @@ impl<'a> Network<'a> {
             NodeKind::BPin { .. } => "BPin Node",
         };
         format!("{kind}: ({:.4}, {:.4}) on {}", f64::from(node.pt.0) / dbus, f64::from(node.pt.1) / dbus, self.tech.layers[node.li].name)
+    }
+
+    /// A node as the solve's dumps print it: an instance terminal's node adds the terminal's name.
+    pub fn describe_full(&self, n: NodeId, net: &NetInput) -> String {
+        match self.arena[n].kind {
+            NodeKind::ITerm { iterm, .. } => format!("{}: {}", self.describe(n), net.iterms[iterm].name),
+            _ => self.describe(n),
+        }
     }
 
     /// Every layer node, numbered in map order: one dump file's lines.

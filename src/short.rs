@@ -10,6 +10,8 @@ use std::collections::{BTreeMap, HashMap};
 use vyges_drt::polygon90::Polygon90Set;
 use vyges_drt::rtree::PackedRTree;
 
+use crate::network::ref_tree;
+
 use crate::input::{Rect, Stream};
 use crate::network::Network;
 
@@ -643,7 +645,7 @@ fn master_obstructions(nw: &Network, m: &MasterGeom) -> Result<LayerPieces, Stri
 pub fn check_short(nw: &Network, si: &ShortInputs, check_placed: bool) -> Result<(Vec<Short>, bool), String> {
     let mut trees = HashMap::new();
     for (k, shapes) in &nw.shapes {
-        trees.insert(k.li, PackedRTree::new(shapes.iter().map(|s| (s.rect, s.rect)).collect()));
+        trees.insert(k.li, ref_tree(shapes.iter().map(|s| (s.rect, s.rect)).collect()));
     }
     let mut w = Walk { nw, trees, shorts: Vec::new() };
     let counts = |placed: bool, fixed: bool| if check_placed { placed } else { fixed };

@@ -21,3 +21,9 @@ pub fn short_inputs(db: &vyges_opendb::Db, name: &str) -> Result<ShortInputs, St
     let names = db.psm_short_names(name).map_err(|e| e.to_string())?;
     decode_short_inputs(&raw, &names)
 }
+
+/// The solve's database inputs: areas, layer resistances, the net's sig type, its instances.
+pub fn solve_inputs(db: &vyges_opendb::Db, name: &str) -> Result<crate::solve::SolveInputs, String> {
+    let raw = db.psm_solve_inputs(name).map_err(|e| e.to_string())?;
+    crate::solve::decode_solve_inputs(&raw)
+}
