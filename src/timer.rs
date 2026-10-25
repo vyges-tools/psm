@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use vyges_opendb::Db;
 use vyges_rsz::preamble::Libs;
-use vyges_sta::liberty::Library;
+use vyges_sta::liberty::{Direction, Library};
 use vyges_sta::power::{self, Activities, ActivityInputs};
 use vyges_sta::search::Search;
 
@@ -75,9 +75,11 @@ pub fn activities(db: &Db, inp: &TimerInputs<'_>) -> Result<Activities, String> 
     let propagated = !s.propagated.is_empty();
     // One graph per scene, each timed with its own libraries: the slew bound reads every
     // analysis point. The propagation walks the first (every scene has the same graph).
+    let unlinked = unlinked_masters(db, &libs)?;
     let mut graphs = Vec::new();
     for k in 0..libs.scene_count() {
-        let mut g = vyges_rsz::repair_design::timer_graph(&libs, k, &netlist, &env, &mpins).map_err(|e| e.message().to_string())?;
+        let mut g = vyges_sta::graph::Graph::build_with_unlinked(libs.scene_slice(k), &netlist, Some(&mpins), &unlinked)?;
+        g.sdc = env.clone();
         if !propagated {
             g.ideal_clock = vyges_rsz::timing::clock_pins(&g, &clock_sources).into_iter().collect();
         }
@@ -101,6 +103,36 @@ pub fn activities(db: &Db, inp: &TimerInputs<'_>) -> Result<Activities, String> 
     let min_period = if ssdc.clocks.is_empty() { 0.0 } else { ssdc.clocks.iter().map(|c| c.period).fold(f32::INFINITY, f32::min) };
     let inputs = ActivityInputs { level: &level, clock_source: &clock_source, is_clock: &is_clock, clock: &clock, min_rf_slew: &min_rf_slew, min_period, time_unit: time_scale };
     power::ensure_activities(g, &inputs)
+}
+
+/// The masters no library holds, each with its signal terminals in order and their directions
+/// from the database (`dbNetwork::direction` of a pin with no liberty port: INOUT and FEEDTHRU are
+/// bidirect). The timer makes their vertices too.
+fn unlinked_masters(db: &Db, libs: &Libs) -> Result<HashMap<String, Vec<(String, Direction)>>, String> {
+    let mut out = HashMap::new();
+    for i in 0..db.num_masters().map_err(|e| e.to_string())? {
+        let name = db.nth_master_name(i).map_err(|e| e.to_string())?;
+        if libs.libs.iter().any(|l| l.cells.contains_key(&name)) {
+            continue;
+        }
+        let supply: Vec<String> = db.master_mterms(&name).map_err(|e| e.to_string())?.into_iter().filter(|(_, t)| t == "POWER" || t == "GROUND").map(|(n, _)| n).collect();
+        let pins = db
+            .master_mterm_io(&name)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|(n, _)| !supply.contains(n))
+            .map(|(n, io)| {
+                let dir = match io.as_str() {
+                    "INPUT" => Direction::Input,
+                    "OUTPUT" => Direction::Output,
+                    _ => Direction::Bidirect,
+                };
+                (n, dir)
+            })
+            .collect();
+        out.insert(name, pins);
+    }
+    Ok(out)
 }
 
 /// `getMinRfSlew`: over the analysis points (one scene: min, then max), the least of the rise and
