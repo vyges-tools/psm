@@ -24,6 +24,9 @@ vyges-drt = { git = "https://github.com/vyges-tools/drt", branch = "main", defau
 vyges-sta = { git = "https://github.com/vyges-tools/sta.git", branch = "main" }
 # Gzipped liberty files.
 miniz_oxide = "0.8"
+# The solve's sparse LU: a transcription of the pinned Eigen SparseLU, bit for bit (MPL-2.0, its own
+# crate so the licence stays with its files).
+vyges-sparselu = { git = "https://github.com/vyges-tools/sparselu", branch = "main" }
 
 [features]
 default = ["odb"]
@@ -51,3 +54,6 @@ vyges-drt = { path = "../vyges-tools-drt" }
 
 [patch."https://github.com/vyges-tools/sta.git"]
 vyges-sta = { path = "../vyges-tools-sta" }
+
+[patch."https://github.com/vyges-tools/sparselu"]
+vyges-sparselu = { path = "../vyges-tools-sparselu" }

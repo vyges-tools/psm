@@ -382,8 +382,18 @@ fn analyze(args: &[String]) -> ExitCode {
         write_dump(dir, "nodes", &solve::node_lines(&network, &net_input, &srcs, &order));
         write_dump(dir, "G", &solve::matrix_lines(&m));
         write_dump(dir, "J", &solve::vector_lines("J", &m.j));
+        write_dump(dir, "G_bits", &solve::matrix_bits_lines(&m));
+        write_dump(dir, "J_bits", &solve::vector_bits_lines(&m.j));
     }
-    refuse("analyze past the conductance matrix")
+    let Ok(lu) = vyges_sparselu::SparseLu::compute(&solve::csc_of(&m), vyges_sparselu::REFERENCE_CACHES) else {
+        return refuse("a structurally singular conductance matrix");
+    };
+    let (_, _, v) = lu.solve_stages(&m.j);
+    if let Some(dir) = &dump_dir {
+        write_dump(dir, "lu", &lu.stage_lines(&m.j));
+        write_dump(dir, "V", &solve::vector_lines("V", &v));
+    }
+    refuse("analyze past the solve")
 }
 
 /// Print a failure's lines; exit 1.

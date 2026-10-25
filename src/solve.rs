@@ -953,12 +953,37 @@ pub fn build_cond_matrix_and_voltages(
     m
 }
 
+/// G as the solver takes it: compressed by column, rows ascending.
+pub fn csc_of(m: &Matrix) -> vyges_sparselu::Csc {
+    let n = m.j.len();
+    let mut a = vyges_sparselu::Csc { nrows: n, ncols: n, col_ptr: vec![0; n + 1], row_idx: Vec::with_capacity(m.g.len()), values: Vec::with_capacity(m.g.len()) };
+    for (&(c, r), &v) in &m.g {
+        a.col_ptr[c + 1] += 1;
+        a.row_idx.push(r);
+        a.values.push(v);
+    }
+    for c in 0..n {
+        a.col_ptr[c + 1] += a.col_ptr[c];
+    }
+    a
+}
+
 pub fn matrix_lines(m: &Matrix) -> Vec<String> {
     m.g.iter().map(|(&(c, r), &v)| format!("G[{c}, {r}] = {}", fmt_e(v, 15))).collect()
 }
 
 pub fn vector_lines(name: &str, v: &[f64]) -> Vec<String> {
     v.iter().enumerate().map(|(i, &x)| format!("{name}[{i}] = {}", fmt_e(x, 15))).collect()
+}
+
+/// G exactly, for an instrument: `column row bits` per entry, the IEEE bits in hex.
+pub fn matrix_bits_lines(m: &Matrix) -> Vec<String> {
+    m.g.iter().map(|(&(c, r), &v)| format!("{c} {r} {:016x}", v.to_bits())).collect()
+}
+
+/// A vector exactly, for an instrument: the IEEE bits in hex, one per line.
+pub fn vector_bits_lines(v: &[f64]) -> Vec<String> {
+    v.iter().map(|x| format!("{:016x}", x.to_bits())).collect()
 }
 
 #[cfg(test)]

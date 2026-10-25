@@ -505,8 +505,13 @@ dependencies = [
  "vyges-drt",
  "vyges-events",
  "vyges-opendb",
+ "vyges-sparselu",
  "vyges-sta",
 ]
+
+[[package]]
+name = "vyges-sparselu"
+version = "0.1.45"
 
 [[package]]
 name = "vyges-sta"
