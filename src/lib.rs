@@ -12,3 +12,5 @@ pub mod solution;
 pub mod solve;
 #[cfg(feature = "odb")]
 pub mod read;
+#[cfg(feature = "odb")]
+pub mod timer;

@@ -28,9 +28,16 @@ miniz_oxide = "0.8"
 # crate so the licence stays with its files).
 vyges-sparselu = { git = "https://github.com/vyges-tools/sparselu", branch = "main" }
 
+# The instance power's timer: the database's netlist and the constraints in the timer's form, as
+# the resizer and the router build them (`timer::netlist`, `env::search_sdc_on`, `env::sdc_env`).
+vyges-rsz = { git = "https://github.com/vyges-tools/rsz.git", branch = "main", features = ["cli"], optional = true }
+vyges-grt = { git = "https://github.com/vyges-tools/grt.git", branch = "main", default-features = false, features = ["odb"], optional = true }
+vyges-est = { git = "https://github.com/vyges-tools/est.git", branch = "main", features = ["odb"], optional = true }
+vyges-loom = { git = "https://github.com/vyges-tools/loom.git", branch = "main", optional = true }
+
 [features]
 default = ["odb"]
-odb = ["dep:vyges-opendb"]
+odb = ["dep:vyges-opendb", "dep:vyges-rsz", "dep:vyges-grt", "dep:vyges-est", "dep:vyges-loom"]
 
 [[bin]]
 name = "vyges-psm"
@@ -57,3 +64,21 @@ vyges-sta = { path = "../vyges-tools-sta" }
 
 [patch."https://github.com/vyges-tools/sparselu"]
 vyges-sparselu = { path = "../vyges-tools-sparselu" }
+
+[patch."https://github.com/vyges-tools/rsz.git"]
+vyges-rsz = { path = "../vyges-tools-rsz" }
+
+[patch."https://github.com/vyges-tools/grt.git"]
+vyges-grt = { path = "../vyges-tools-grt" }
+
+[patch."https://github.com/vyges-tools/est.git"]
+vyges-est = { path = "../vyges-tools-est" }
+
+[patch."https://github.com/vyges-tools/stt.git"]
+vyges-stt = { path = "../vyges-tools-stt" }
+
+[patch."https://github.com/vyges-tools/dpl.git"]
+vyges-dpl = { path = "../vyges-tools-dpl" }
+
+[patch."https://github.com/vyges-tools/loom.git"]
+vyges-loom = { path = "../vyges-tools-loom" }

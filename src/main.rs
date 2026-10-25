@@ -28,6 +28,9 @@ USAGE:
   vyges loom psm write-spice  <design.odb> <file> --net NET --save-solution FILE [--vsrc FILE]
                                                   the power grid as a SPICE netlist, with the currents
                                                   of the session's last analyze of the net
+  vyges loom psm activities   <design.odb> --liberty FILE... --sdc FILE
+                                                  diagnostic: the timer's switching-activity propagation,
+                                                  each value set (IEEE bits), in the order it was set
   vyges loom psm --describe
   vyges loom psm --help
   vyges loom psm --version
@@ -106,6 +109,7 @@ fn main() -> ExitCode {
         Some("check") => check(&args[1..]),
         Some("analyze") => analyze(&args[1..], false),
         Some("write-spice") => analyze(&args[1..], true),
+        Some("activities") => activities(&args[1..]),
         Some(cmd) if COMMANDS.contains(&cmd) => refuse(cmd),
         Some(other) => {
             eprintln!("vyges-psm: unknown command `{other}`\n\n{USAGE}");
@@ -402,6 +406,47 @@ fn analyze(args: &[String], spice: bool) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// `activities`: the instance power's activity propagation over the design, its trace printed.
+fn activities(args: &[String]) -> ExitCode {
+    let (mut design, mut liberties, mut sdcs) = (None::<String>, Vec::new(), Vec::new());
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--liberty" | "--sdc" => {
+                let Some(f) = it.next() else { return usage_error(&format!("{a} needs a file")) };
+                let text = match read_maybe_gz(f) {
+                    Ok(t) => t,
+                    Err(e) => return usage_error(&format!("cannot read {f}: {e}")),
+                };
+                if a == "--liberty" { liberties.push(text) } else { sdcs.push(text) }
+            }
+            v if v.starts_with('-') => return usage_error(&format!("unknown option `{v}`")),
+            v if design.is_none() => design = Some(v.to_string()),
+            v => return usage_error(&format!("unexpected argument `{v}`")),
+        }
+    }
+    let Some(design) = design else { return usage_error("activities needs <design.odb>") };
+    let db = match vyges_opendb::Db::open(&design) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("vyges-psm: cannot read {design}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    match vyges_psm::timer::activities(&db, &vyges_psm::timer::TimerInputs { liberties: &liberties, sdcs: &sdcs }) {
+        Ok(a) => {
+            for l in &a.trace {
+                println!("{l}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("vyges-psm: activities: {e}");
+            refuse("this design's instance power")
+        }
+    }
 }
 
 /// `write-spice` (`writeSpiceFile`): the net's network as constructed (no check), written with the
