@@ -23,7 +23,7 @@ USAGE:
                                 [--error-file FILE] [--dump-dir DIR] [--stats]
                                                   every power/ground shape and instance pin reaches a supply
   vyges loom psm analyze      <design.odb> --net NET [--voltage-file FILE] [--enable-em [--em-file FILE]]
-                                [--dump-dir DIR]
+                                [--save-solution FILE [--allow-reuse]] [--dump-dir DIR]
                                                   static IR drop: per-node voltages, worst and average drop
   vyges loom psm write-spice  <design.odb> <job>  write the power grid as a SPICE netlist
   vyges loom psm --describe
@@ -38,6 +38,8 @@ OPTIONS:
   --voltage-file FILE   analyze: write each instance terminal's voltage (CSV)
   --enable-em           analyze: report the grid's connection currents (maximum, average, count)
   --em-file FILE        analyze: with --enable-em, write each connection's current (CSV)
+  --save-solution FILE  analyze: the session's solutions, kept between calls (read, then updated)
+  --allow-reuse         analyze: report the saved solution of this net and corner instead of solving
   --dump-dir DIR        write the network after each construction stage (psm_<stage>.txt) to DIR
   --stats               print the network's shape, node and connection counts
   -o FILE               write the report (or the output database) to FILE
@@ -66,7 +68,7 @@ const DESCRIBE: &str = r#"{
   "provenance_limitations": [
     "check: an error file holding a short whose overlap is not one rectangle refuses (exit 3).",
     "check refuses (exit 3) on an octilinear special wire of another net, a pin layer mixing a polygon off the Manhattan grid with other metal, and an off-grid obstruction polygon.",
-    "analyze is built end to end except -allow_reuse (a cached solution); write-spice refuses with exit 3."
+    "analyze is built end to end; a solution is kept between calls only through --save-solution; write-spice refuses with exit 3."
   ],
   "invocation": { "args_template": ["check"], "emits_json": true },
   "inputs": { "type": "object", "properties": {} },
@@ -277,10 +279,12 @@ struct AnalyzeOpts {
 }
 
 /// `analyze`: the connectivity check (terminals not required, not floorplanning), then the solve in
-/// its order: the solve, its report, EM, the instance voltage file. Not yet: a reused solution.
+/// its order: the solve (or, with `--allow-reuse`, the saved solution of this net and corner), its
+/// report, EM, the instance voltage file.
 fn analyze(args: &[String]) -> ExitCode {
     let (mut design, mut net, mut dump_dir, mut error_file) = (None, None, None, None);
     let (mut voltage_file, mut enable_em, mut em_file) = (None, false, None::<String>);
+    let (mut save_solution, mut allow_reuse) = (None::<String>, false);
     let mut o = AnalyzeOpts::default();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -303,6 +307,8 @@ fn analyze(args: &[String]) -> ExitCode {
                 "--voltage-file" => voltage_file = Some(value("a file")?),
                 "--enable-em" => enable_em = true,
                 "--em-file" => em_file = Some(value("a file")?),
+                "--save-solution" => save_solution = Some(value("a file")?),
+                "--allow-reuse" => allow_reuse = true,
                 v if v.starts_with('-') => return Err(usage_error(&format!("unknown option `{v}`"))),
                 v if design.is_none() => design = Some(v.to_string()),
                 v => return Err(usage_error(&format!("unexpected argument `{v}`"))),
@@ -347,97 +353,35 @@ fn analyze(args: &[String]) -> ExitCode {
     };
     use vyges_psm::solve;
     let net_id = db.net_id(&net).unwrap_or(0);
-    let power_voltage = || solve::power_net_voltage(inputs.sig, net_id, &session.voltages, &session.corner, None, session.pvt);
-    let estimate = solve::layer_rc_resistance(&session.layer_rcs, &session.corner, session.units, |n| tech.layers.iter().position(|l| l.name == n));
-    let estimate = match estimate {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("vyges-psm: {e}");
-            return refuse("this layer RC setting");
+    let mut store = match &save_solution {
+        Some(path) => match load_store(path, &design) {
+            Ok(s) => Some(s),
+            Err(code) => return code,
+        },
+        None => None,
+    };
+    let c = Call { net: &net, net_id, tech: &tech, net_input: &net_input, inputs: &inputs, session: &session, o: &o, network: &network, dump_dir: dump_dir.as_deref() };
+    let previous = store.as_ref().and_then(|s| s.get(&net, &session.corner)).cloned();
+    let solved = match previous.filter(|p| allow_reuse && p.has_solution) {
+        Some(p) => {
+            println!("[INFO PSM-0011] Reusing previous solution");
+            Solved { voltages: p.voltages.into_iter().collect(), src_voltage: p.src_voltage, total_power: p.total_power, cond: None }
         }
+        None => match solve_net(&c, &mut store, save_solution.as_deref()) {
+            Ok(s) => s,
+            Err(code) => return code,
+        },
     };
-    let res = solve::resistance_map(&inputs, tech.dbus, &estimate);
-    if let Err(lines) = solve::assert_resistance_map(&network, &inputs, &res) {
-        return fail(&lines);
-    }
-    let Some(net_voltage) = solve::net_voltage(inputs.sig, power_voltage) else {
-        return fail(&[format!("[ERROR PSM-0079] Cannot determine the supply voltage for {net}.")]);
-    };
-    let mut srcs = solve::Sources::default();
-    let mut log = solve::SourceLog::default();
-    let found = solve::generate_source_nodes(&network, &inputs, &session.settings, session.source_type, o.vsrc.as_deref(), net_voltage, &mut srcs, &mut log);
-    let (found, src_voltage) = match found {
-        Ok(x) => x,
-        Err(lines) => return fail(&lines),
-    };
-    for l in &log.lines {
-        println!("{l}");
-    }
-    let (real, sources) = solve::split_sources(&network, &session.settings, found, &mut srcs);
-    let cond = solve::conductance_map(&network, &network.connections, &res);
-    if let Some(dir) = &dump_dir {
-        write_dump(dir, "cond", &solve::conductance_lines(&network, &net_input, &cond));
-    }
-    let src_conds = solve::source_conductances(&network, &srcs, &session.settings, &real);
-    let Some(power_voltage) = power_voltage() else {
-        return fail(&[format!("[ERROR PSM-0079] Cannot determine the supply voltage for {net}.")]);
-    };
-    if power_voltage == 0.0 {
-        return fail(&["[ERROR PSM-0074] Unable to determine voltage for power nets.".to_string()]);
-    }
-    let (currents, total_power) =
-        solve::build_node_current_map(&network, &inputs, &net_input, power_voltage, &session.timer_power, &session.user_power);
-    let order = solve::assign_node_ids(&network, &cond, &srcs, &real, &sources);
-    let m = solve::build_cond_matrix_and_voltages(&network, &srcs, &cond, &src_conds, &order, &currents, src_voltage, &sources);
-    if let Some(dir) = &dump_dir {
-        write_dump(dir, "nodes", &solve::node_lines(&network, &net_input, &srcs, &order));
-        write_dump(dir, "G", &solve::matrix_lines(&m));
-        write_dump(dir, "J", &solve::vector_lines("J", &m.j));
-        write_dump(dir, "G_bits", &solve::matrix_bits_lines(&m));
-        write_dump(dir, "J_bits", &solve::vector_bits_lines(&m.j));
-    }
-    let Ok(lu) = vyges_sparselu::SparseLu::compute(&solve::csc_of(&m), vyges_sparselu::REFERENCE_CACHES) else {
-        return refuse("a structurally singular conductance matrix");
-    };
-    let (_, _, v) = lu.solve_stages(&m.j);
-    if let Some(dir) = &dump_dir {
-        write_dump(dir, "lu", &lu.stage_lines(&m.j));
-        write_dump(dir, "V", &solve::vector_lines("V", &v));
-    }
-    // report: the power net's voltage is now the solution's when the net is the power net.
-    let voltages = solve::node_voltages(&order, &v);
-    let previous = solve::power_net_voltage(inputs.sig, net_id, &session.voltages, &session.corner, Some(src_voltage), session.pvt);
-    let Some(results) = solve::get_solution(&network.nodes, &voltages, src_voltage, total_power, previous.unwrap_or(power_voltage)) else {
-        return refuse("a grid node outside the matrix");
-    };
-    let report = solve::report_lines(&net, &session.corner, &results);
-    for l in &report {
-        println!("{l}");
-    }
-    if let Some(dir) = &dump_dir {
-        write_dump(dir, "report", &report);
+    if let Err(code) = report(&c, &solved) {
+        return code;
     }
     if enable_em {
-        let Some(currents) = solve::current_map(&network, &cond, &voltages) else {
-            return refuse("a connection node outside the matrix");
-        };
-        let em = solve::em_report_lines(&net, &session.corner, &solve::get_em_solution(&currents));
-        for l in &em {
-            println!("{l}");
-        }
-        if let Some(dir) = &dump_dir {
-            write_dump(dir, "em", &em);
-        }
-        if let Some(path) = &em_file {
-            let mut text = solve::em_file_lines(&network, tech.dbus, &currents).join("\n");
-            text.push('\n');
-            if std::fs::write(path, text).is_err() {
-                return fail(&[format!("[ERROR PSM-0091] Unable to open {path} to write EM file")]);
-            }
+        if let Err(code) = report_em(&c, &solved, em_file.as_deref()) {
+            return code;
         }
     }
     if let Some(path) = voltage_file {
-        let Some(lines) = solve::instance_voltage_lines(&network, &net_input, tech.dbus, &voltages) else {
+        let Some(lines) = solve::instance_voltage_lines(&network, &net_input, tech.dbus, &solved.voltages) else {
             return refuse("a terminal node outside the matrix");
         };
         let mut text = lines.join("\n");
@@ -447,6 +391,182 @@ fn analyze(args: &[String]) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// What one `analyze` call reads.
+struct Call<'a> {
+    net: &'a str,
+    net_id: u32,
+    tech: &'a vyges_psm::input::Tech,
+    net_input: &'a vyges_psm::input::NetInput,
+    inputs: &'a vyges_psm::solve::SolveInputs,
+    session: &'a Session,
+    o: &'a AnalyzeOpts,
+    network: &'a vyges_psm::network::Network<'a>,
+    dump_dir: Option<&'a std::path::Path>,
+}
+
+/// A net's solution on the corner: solved now, or reused (then without a conductance map).
+struct Solved {
+    voltages: std::collections::HashMap<vyges_psm::network::NodeId, f64>,
+    src_voltage: f64,
+    total_power: f32,
+    cond: Option<Vec<(vyges_psm::network::ConnId, f64)>>,
+}
+
+/// The session's solution store; a missing file is an empty store.
+fn load_store(path: &str, design: &str) -> Result<vyges_psm::solution::Store, ExitCode> {
+    use vyges_psm::solution::{fingerprint, Store};
+    let bytes = std::fs::read(design).map_err(|e| {
+        eprintln!("vyges-psm: cannot read {design}: {e}");
+        ExitCode::from(2)
+    })?;
+    let fp = fingerprint(&bytes);
+    match std::fs::read_to_string(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Store { design: fp, solutions: Vec::new() }),
+        Err(e) => {
+            eprintln!("vyges-psm: cannot read {path}: {e}");
+            Err(ExitCode::from(2))
+        }
+        Ok(text) => Store::parse(&text, fp).map_err(|e| {
+            eprintln!("vyges-psm: {path}: {e}");
+            ExitCode::from(2)
+        }),
+    }
+}
+
+fn save_store(store: &Option<vyges_psm::solution::Store>, path: Option<&str>) -> Result<(), ExitCode> {
+    if let (Some(s), Some(p)) = (store, path) {
+        if let Err(e) = std::fs::write(p, s.text()) {
+            eprintln!("vyges-psm: cannot write {p}: {e}");
+            return Err(ExitCode::from(2));
+        }
+    }
+    Ok(())
+}
+
+/// Each connection's resistance on the corner: the layer RC estimate, then the map.
+fn resistances(c: &Call) -> Result<Vec<f64>, ExitCode> {
+    use vyges_psm::solve;
+    let s = c.session;
+    let estimate = solve::layer_rc_resistance(&s.layer_rcs, &s.corner, s.units, |n| c.tech.layers.iter().position(|l| l.name == n));
+    let estimate = estimate.map_err(|e| {
+        eprintln!("vyges-psm: {e}");
+        refuse("this layer RC setting")
+    })?;
+    Ok(solve::resistance_map(c.inputs, c.tech.dbus, &estimate))
+}
+
+/// The solve (`IRSolver::solve`), in its order. The power net's voltage is the previous solution's
+/// on this corner when there is one; the stored solution is reset once the resistances are checked
+/// and replaced at the end.
+fn solve_net(c: &Call, store: &mut Option<vyges_psm::solution::Store>, save: Option<&str>) -> Result<Solved, ExitCode> {
+    use vyges_psm::solve;
+    let (s, network, net) = (c.session, c.network, c.net);
+    let previous = store.as_ref().and_then(|st| st.get(net, &s.corner)).map(|p| p.src_voltage);
+    let power_voltage = || solve::power_net_voltage(c.inputs.sig, c.net_id, &s.voltages, &s.corner, previous, s.pvt);
+    let res = resistances(c)?;
+    solve::assert_resistance_map(network, c.inputs, &res).map_err(|lines| fail(&lines))?;
+    if let Some(st) = store.as_mut() {
+        st.reset(net, &s.corner);
+    }
+    save_store(store, save)?;
+    let net_voltage = solve::net_voltage(c.inputs.sig, power_voltage)
+        .ok_or_else(|| fail(&[format!("[ERROR PSM-0079] Cannot determine the supply voltage for {net}.")]))?;
+    let mut srcs = solve::Sources::default();
+    let mut log = solve::SourceLog::default();
+    let found = solve::generate_source_nodes(network, c.inputs, &s.settings, s.source_type, c.o.vsrc.as_deref(), net_voltage, &mut srcs, &mut log);
+    let (found, src_voltage) = found.map_err(|lines| fail(&lines))?;
+    for l in &log.lines {
+        println!("{l}");
+    }
+    let (real, sources) = solve::split_sources(network, &s.settings, found, &mut srcs);
+    let cond = solve::conductance_map(network, &network.connections, &res);
+    if let Some(dir) = c.dump_dir {
+        write_dump(dir, "cond", &solve::conductance_lines(network, c.net_input, &cond));
+    }
+    let src_conds = solve::source_conductances(network, &srcs, &s.settings, &real);
+    let power_voltage = power_voltage().ok_or_else(|| fail(&[format!("[ERROR PSM-0079] Cannot determine the supply voltage for {net}.")]))?;
+    if power_voltage == 0.0 {
+        return Err(fail(&["[ERROR PSM-0074] Unable to determine voltage for power nets.".to_string()]));
+    }
+    let (currents, total_power) = solve::build_node_current_map(network, c.inputs, c.net_input, power_voltage, &s.timer_power, &s.user_power);
+    let order = solve::assign_node_ids(network, &cond, &srcs, &real, &sources);
+    let m = solve::build_cond_matrix_and_voltages(network, &srcs, &cond, &src_conds, &order, &currents, src_voltage, &sources);
+    if let Some(dir) = c.dump_dir {
+        write_dump(dir, "nodes", &solve::node_lines(network, c.net_input, &srcs, &order));
+        write_dump(dir, "G", &solve::matrix_lines(&m));
+        write_dump(dir, "J", &solve::vector_lines("J", &m.j));
+        write_dump(dir, "G_bits", &solve::matrix_bits_lines(&m));
+        write_dump(dir, "J_bits", &solve::vector_bits_lines(&m.j));
+    }
+    let Ok(lu) = vyges_sparselu::SparseLu::compute(&solve::csc_of(&m), vyges_sparselu::REFERENCE_CACHES) else {
+        return Err(refuse("a structurally singular conductance matrix"));
+    };
+    let (_, _, v) = lu.solve_stages(&m.j);
+    if let Some(dir) = c.dump_dir {
+        write_dump(dir, "lu", &lu.stage_lines(&m.j));
+        write_dump(dir, "V", &solve::vector_lines("V", &v));
+    }
+    let voltages = solve::node_voltages(&order, &v);
+    if let Some(st) = store.as_mut() {
+        let mut kept: Vec<(vyges_psm::network::NodeId, f64)> = voltages.iter().map(|(&k, &x)| (k, x)).collect();
+        kept.sort_by_key(|p| p.0);
+        st.put(vyges_psm::solution::Solution {
+            net: net.to_string(),
+            corner: s.corner.clone(),
+            src_voltage,
+            total_power,
+            has_solution: !voltages.is_empty() && !currents.is_empty(),
+            voltages: kept,
+        });
+    }
+    save_store(store, save)?;
+    Ok(Solved { voltages, src_voltage, total_power, cond: Some(cond) })
+}
+
+/// The IR report (`report`): the power net's voltage is now the solution's when the net is it.
+fn report(c: &Call, sol: &Solved) -> Result<(), ExitCode> {
+    use vyges_psm::solve;
+    let s = c.session;
+    let power_voltage = solve::power_net_voltage(c.inputs.sig, c.net_id, &s.voltages, &s.corner, Some(sol.src_voltage), s.pvt)
+        .ok_or_else(|| fail(&[format!("[ERROR PSM-0079] Cannot determine the supply voltage for {}.", c.net)]))?;
+    let results = solve::get_solution(&c.network.nodes, &sol.voltages, sol.src_voltage, sol.total_power, power_voltage)
+        .ok_or_else(|| refuse("a grid node outside the matrix"))?;
+    let report = solve::report_lines(c.net, &s.corner, &results);
+    for l in &report {
+        println!("{l}");
+    }
+    if let Some(dir) = c.dump_dir {
+        write_dump(dir, "report", &report);
+    }
+    Ok(())
+}
+
+/// The EM report and file (`reportEM`, `writeEMFile`): the conductances are the corner's, taken
+/// again when the solution was reused.
+fn report_em(c: &Call, sol: &Solved, em_file: Option<&str>) -> Result<(), ExitCode> {
+    use vyges_psm::solve;
+    let cond = match &sol.cond {
+        Some(cond) => cond.clone(),
+        None => solve::conductance_map(c.network, &c.network.connections, &resistances(c)?),
+    };
+    let currents = solve::current_map(c.network, &cond, &sol.voltages).ok_or_else(|| refuse("a connection node outside the matrix"))?;
+    let em = solve::em_report_lines(c.net, &c.session.corner, &solve::get_em_solution(&currents));
+    for l in &em {
+        println!("{l}");
+    }
+    if let Some(dir) = c.dump_dir {
+        write_dump(dir, "em", &em);
+    }
+    if let Some(path) = em_file {
+        let mut text = solve::em_file_lines(c.network, c.tech.dbus, &currents).join("\n");
+        text.push('\n');
+        if std::fs::write(path, text).is_err() {
+            return Err(fail(&[format!("[ERROR PSM-0091] Unable to open {path} to write EM file")]));
+        }
+    }
+    Ok(())
 }
 
 /// Print a failure's lines; exit 1.
