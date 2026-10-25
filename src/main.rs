@@ -28,7 +28,8 @@ USAGE:
   vyges loom psm write-spice  <design.odb> <file> --net NET --save-solution FILE [--vsrc FILE]
                                                   the power grid as a SPICE netlist, with the currents
                                                   of the session's last analyze of the net
-  vyges loom psm activities   <design.odb> --liberty FILE... --sdc FILE
+  vyges loom psm activities   <design.odb> [--corners C,C] --liberty FILE | --liberty-corner C FILE ...
+                                [--sdc FILE]
                                                   diagnostic: the timer's switching-activity propagation,
                                                   each value set (IEEE bits), in the order it was set
   vyges loom psm --describe
@@ -410,17 +411,29 @@ fn analyze(args: &[String], spice: bool) -> ExitCode {
 
 /// `activities`: the instance power's activity propagation over the design, its trace printed.
 fn activities(args: &[String]) -> ExitCode {
-    let (mut design, mut liberties, mut sdcs) = (None::<String>, Vec::new(), Vec::new());
+    let (mut design, mut corners, mut liberties, mut sdcs) = (None::<String>, Vec::new(), Vec::new(), Vec::new());
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--liberty" | "--sdc" => {
+            "--corners" => match it.next() {
+                Some(c) => corners = c.split([',', ' ']).filter(|x| !x.is_empty()).map(String::from).collect(),
+                None => return usage_error("--corners needs a list"),
+            },
+            "--liberty" | "--liberty-corner" | "--sdc" => {
+                let corner = if a == "--liberty-corner" {
+                    match it.next() {
+                        Some(c) => Some(c.clone()),
+                        None => return usage_error("--liberty-corner needs a corner and a file"),
+                    }
+                } else {
+                    None
+                };
                 let Some(f) = it.next() else { return usage_error(&format!("{a} needs a file")) };
                 let text = match read_maybe_gz(f) {
                     Ok(t) => t,
                     Err(e) => return usage_error(&format!("cannot read {f}: {e}")),
                 };
-                if a == "--liberty" { liberties.push(text) } else { sdcs.push(text) }
+                if a == "--sdc" { sdcs.push(text) } else { liberties.push((corner, text)) }
             }
             v if v.starts_with('-') => return usage_error(&format!("unknown option `{v}`")),
             v if design.is_none() => design = Some(v.to_string()),
@@ -435,7 +448,7 @@ fn activities(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match vyges_psm::timer::activities(&db, &vyges_psm::timer::TimerInputs { liberties: &liberties, sdcs: &sdcs }) {
+    match vyges_psm::timer::activities(&db, &vyges_psm::timer::TimerInputs { corners: &corners, liberties: &liberties, sdcs: &sdcs }) {
         Ok(a) => {
             for l in &a.trace {
                 println!("{l}");
