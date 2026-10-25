@@ -22,7 +22,8 @@ USAGE:
   vyges loom psm check        <design.odb> --net NET [--floorplanning] [--dont-require-terminals]
                                 [--error-file FILE] [--dump-dir DIR] [--stats]
                                                   every power/ground shape and instance pin reaches a supply
-  vyges loom psm analyze      <design.odb> --net NET [--dump-dir DIR]
+  vyges loom psm analyze      <design.odb> --net NET [--voltage-file FILE] [--enable-em [--em-file FILE]]
+                                [--dump-dir DIR]
                                                   static IR drop: per-node voltages, worst and average drop
   vyges loom psm write-spice  <design.odb> <job>  write the power grid as a SPICE netlist
   vyges loom psm --describe
@@ -34,6 +35,9 @@ OPTIONS:
   --floorplanning       check: only FIXED instances count (the grid before placement)
   --dont-require-terminals  check: a net without a placed block terminal is not an error
   --error-file FILE     check: write the net's unconnected and shorted shapes as a marker report
+  --voltage-file FILE   analyze: write each instance terminal's voltage (CSV)
+  --enable-em           analyze: report the grid's connection currents (maximum, average, count)
+  --em-file FILE        analyze: with --enable-em, write each connection's current (CSV)
   --dump-dir DIR        write the network after each construction stage (psm_<stage>.txt) to DIR
   --stats               print the network's shape, node and connection counts
   -o FILE               write the report (or the output database) to FILE
@@ -62,7 +66,7 @@ const DESCRIBE: &str = r#"{
   "provenance_limitations": [
     "check: an error file holding a short whose overlap is not one rectangle refuses (exit 3).",
     "check refuses (exit 3) on an octilinear special wire of another net, a pin layer mixing a polygon off the Manhattan grid with other metal, and an off-grid obstruction polygon.",
-    "analyze is built through the conductance map; write-spice refuses with exit 3."
+    "analyze is built end to end except -allow_reuse (a cached solution); write-spice refuses with exit 3."
   ],
   "invocation": { "args_template": ["check"], "emits_json": true },
   "inputs": { "type": "object", "properties": {} },
@@ -273,9 +277,10 @@ struct AnalyzeOpts {
 }
 
 /// `analyze`: the connectivity check (terminals not required, not floorplanning), then the solve in
-/// its order. Built so far: through the conductance matrix and current vector.
+/// its order: the solve, its report, EM, the instance voltage file. Not yet: a reused solution.
 fn analyze(args: &[String]) -> ExitCode {
     let (mut design, mut net, mut dump_dir, mut error_file) = (None, None, None, None);
+    let (mut voltage_file, mut enable_em, mut em_file) = (None, false, None::<String>);
     let mut o = AnalyzeOpts::default();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -295,6 +300,9 @@ fn analyze(args: &[String]) -> ExitCode {
                 "--sdc" => o.sdcs.push(value("a file")?),
                 "--layer-rc" => o.layer_rcs.push(value("set_layer_rc arguments")?),
                 "--corner" => o.corner = Some(value("a corner name")?),
+                "--voltage-file" => voltage_file = Some(value("a file")?),
+                "--enable-em" => enable_em = true,
+                "--em-file" => em_file = Some(value("a file")?),
                 v if v.starts_with('-') => return Err(usage_error(&format!("unknown option `{v}`"))),
                 v if design.is_none() => design = Some(v.to_string()),
                 v => return Err(usage_error(&format!("unexpected argument `{v}`"))),
@@ -306,6 +314,9 @@ fn analyze(args: &[String]) -> ExitCode {
         }
     }
     let (Some(design), Some(net)) = (design, net) else { return usage_error("analyze needs <design.odb> and --net") };
+    if em_file.is_some() && !enable_em {
+        return fail(&["[ERROR PSM-0055] EM file cannot be specified without enabling em analysis.".to_string()]);
+    }
     let db = match vyges_opendb::Db::open(&design) {
         Ok(db) => db,
         Err(e) => {
@@ -374,7 +385,7 @@ fn analyze(args: &[String]) -> ExitCode {
     if power_voltage == 0.0 {
         return fail(&["[ERROR PSM-0074] Unable to determine voltage for power nets.".to_string()]);
     }
-    let (currents, _total_power) =
+    let (currents, total_power) =
         solve::build_node_current_map(&network, &inputs, &net_input, power_voltage, &session.timer_power, &session.user_power);
     let order = solve::assign_node_ids(&network, &cond, &srcs, &real, &sources);
     let m = solve::build_cond_matrix_and_voltages(&network, &srcs, &cond, &src_conds, &order, &currents, src_voltage, &sources);
@@ -393,7 +404,49 @@ fn analyze(args: &[String]) -> ExitCode {
         write_dump(dir, "lu", &lu.stage_lines(&m.j));
         write_dump(dir, "V", &solve::vector_lines("V", &v));
     }
-    refuse("analyze past the solve")
+    // report: the power net's voltage is now the solution's when the net is the power net.
+    let voltages = solve::node_voltages(&order, &v);
+    let previous = solve::power_net_voltage(inputs.sig, net_id, &session.voltages, &session.corner, Some(src_voltage), session.pvt);
+    let Some(results) = solve::get_solution(&network.nodes, &voltages, src_voltage, total_power, previous.unwrap_or(power_voltage)) else {
+        return refuse("a grid node outside the matrix");
+    };
+    let report = solve::report_lines(&net, &session.corner, &results);
+    for l in &report {
+        println!("{l}");
+    }
+    if let Some(dir) = &dump_dir {
+        write_dump(dir, "report", &report);
+    }
+    if enable_em {
+        let Some(currents) = solve::current_map(&network, &cond, &voltages) else {
+            return refuse("a connection node outside the matrix");
+        };
+        let em = solve::em_report_lines(&net, &session.corner, &solve::get_em_solution(&currents));
+        for l in &em {
+            println!("{l}");
+        }
+        if let Some(dir) = &dump_dir {
+            write_dump(dir, "em", &em);
+        }
+        if let Some(path) = &em_file {
+            let mut text = solve::em_file_lines(&network, tech.dbus, &currents).join("\n");
+            text.push('\n');
+            if std::fs::write(path, text).is_err() {
+                return fail(&[format!("[ERROR PSM-0091] Unable to open {path} to write EM file")]);
+            }
+        }
+    }
+    if let Some(path) = voltage_file {
+        let Some(lines) = solve::instance_voltage_lines(&network, &net_input, tech.dbus, &voltages) else {
+            return refuse("a terminal node outside the matrix");
+        };
+        let mut text = lines.join("\n");
+        text.push('\n');
+        if std::fs::write(&path, text).is_err() {
+            return fail(&[format!("[ERROR PSM-0090] Unable to open {path} to write instance voltage file")]);
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 /// Print a failure's lines; exit 1.

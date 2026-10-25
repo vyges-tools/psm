@@ -986,9 +986,269 @@ pub fn vector_bits_lines(v: &[f64]) -> Vec<String> {
     v.iter().map(|x| format!("{:016x}", x.to_bits())).collect()
 }
 
+// ---- the solution ----------------------------------------------------------------------------
+
+/// The solution's summary: the supply the solve was taken at and the power drawn, then the worst
+/// and average node voltage and their drop from the supply, and the worst drop as a percentage of
+/// the power net's voltage (single precision, as kept).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct IrResults {
+    pub net_voltage: f64,
+    pub worst_voltage: f64,
+    pub worst_ir_drop: f64,
+    pub avg_voltage: f64,
+    pub avg_ir_drop: f64,
+    pub max_percent: f32,
+    pub total_power: f32,
+}
+
+/// Each network node's voltage: the matrix's network nodes are its first rows, each row's solution
+/// its node's (the source rows have none).
+pub fn node_voltages(order: &[MNode], v: &[f64]) -> HashMap<NodeId, f64> {
+    order
+        .iter()
+        .zip(v)
+        .filter_map(|(n, &x)| match n {
+            MNode::Net(id) => Some((*id, x)),
+            MNode::Src(_) => None,
+        })
+        .collect()
+}
+
+/// The summary (`getSolution`): the grid nodes layer by layer (database id), each layer's in node
+/// order, summed in that order; the worst is the highest voltage on a ground net (supply 0), else
+/// the lowest, starting from the supply. `None` when a grid node has no voltage.
+pub fn get_solution(grid: &BTreeMap<LayerKey, Vec<NodeId>>, voltages: &HashMap<NodeId, f64>, src_voltage: f64, total_power: f32, power_voltage: f64) -> Option<IrResults> {
+    let mut r = IrResults { net_voltage: src_voltage, total_power, ..IrResults::default() };
+    let is_ground = r.net_voltage == 0.0;
+    let mut all_voltage = 0.0;
+    let mut node_count = 0i32;
+    let mut worst = r.net_voltage;
+    for nodes in grid.values() {
+        for n in nodes {
+            let node_voltage = *voltages.get(n)?;
+            all_voltage += node_voltage;
+            node_count += 1;
+            // std::max / std::min: the first argument unless the second is strictly beyond it.
+            if (is_ground && worst < node_voltage) || (!is_ground && node_voltage < worst) {
+                worst = node_voltage;
+            }
+        }
+    }
+    if node_count == 0 {
+        return Some(r);
+    }
+    r.worst_voltage = worst;
+    r.avg_voltage = all_voltage / f64::from(node_count);
+    if r.net_voltage == 0.0 {
+        r.worst_ir_drop = r.worst_voltage;
+        r.avg_ir_drop = r.avg_voltage;
+    } else {
+        r.worst_ir_drop = r.net_voltage - r.worst_voltage;
+        r.avg_ir_drop = r.net_voltage - r.avg_voltage;
+    }
+    r.max_percent = (100.0 * r.worst_ir_drop / power_voltage) as f32;
+    Some(r)
+}
+
+/// The IR report's lines (`report`).
+pub fn report_lines(net: &str, corner: &str, r: &IrResults) -> Vec<String> {
+    vec![
+        "########## IR report #################".to_string(),
+        format!("Net              : {net}"),
+        format!("Corner           : {corner}"),
+        format!("Total power      : {} W", fmt_e(f64::from(r.total_power), 2)),
+        format!("Supply voltage   : {} V", fmt_e(r.net_voltage, 2)),
+        format!("Worstcase voltage: {} V", fmt_e(r.worst_voltage, 2)),
+        format!("Average voltage  : {} V", fmt_e(r.avg_voltage, 2)),
+        format!("Average IR drop  : {} V", fmt_e(r.avg_ir_drop, 2)),
+        format!("Worstcase IR drop: {} V", fmt_e(r.worst_ir_drop, 2)),
+        format!("Percentage drop  : {:.2} %", r.max_percent),
+        "######################################".to_string(),
+    ]
+}
+
+/// The instance voltage file (`writeInstanceVoltageFile`): a header, then per instance-terminal
+/// node in network order its instance, terminal, layer, location in microns (4 places) and voltage
+/// (6 places). `None` when a terminal node has no voltage.
+pub fn instance_voltage_lines(nw: &Network, net: &NetInput, dbus: i32, voltages: &HashMap<NodeId, f64>) -> Option<Vec<String>> {
+    let mut out = vec!["Instance,Terminal,Layer,X location,Y location,Voltage".to_string()];
+    let dbus = f64::from(dbus);
+    for &n in &nw.iterm_nodes {
+        let node = &nw.arena[n];
+        let NodeKind::ITerm { iterm, .. } = node.kind else { continue };
+        let (inst, term) = net.iterms[iterm].name.rsplit_once('/')?;
+        out.push(voltage_line(inst, term, &nw.tech.layers[node.li].name, node.pt, dbus, *voltages.get(&n)?));
+    }
+    Some(out)
+}
+
+/// One terminal's line: the location is database units over units per micron, 4 places; the
+/// voltage 6 places.
+pub fn voltage_line(inst: &str, term: &str, layer: &str, pt: (i32, i32), dbus: f64, voltage: f64) -> String {
+    format!("{inst},{term},{layer},{:.4},{:.4},{voltage:.6}", f64::from(pt.0) / dbus, f64::from(pt.1) / dbus)
+}
+
+// ---- electromigration -----------------------------------------------------------------------
+
+/// Each connection's current (`generateCurrentMap`): the conductance map's keys in its order, less
+/// those touching an instance terminal's or a block pin's node, each the absolute voltage
+/// difference across it times its conductance. `None` when a node has no voltage.
+pub fn current_map(nw: &Network, cond: &[(ConnId, f64)], voltages: &HashMap<NodeId, f64>) -> Option<Vec<(ConnId, f64)>> {
+    let pin = |n: NodeId| matches!(nw.arena[n].kind, NodeKind::ITerm { .. } | NodeKind::BPin { .. });
+    let mut out = Vec::new();
+    for &(c, g) in cond {
+        let conn = &nw.conns[c];
+        let (n0, n1) = (conn.n0?, conn.n1?);
+        if pin(n0) || pin(n1) {
+            continue;
+        }
+        let voltage_drop = (voltages.get(&n0)? - voltages.get(&n1)?).abs();
+        out.push((c, voltage_drop * g));
+    }
+    Some(out)
+}
+
+/// The EM summary (`getEMSolution`): the most current through one connection, the mean (summed
+/// in map order), and how many connections carry one.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct EmResults {
+    pub max_current: f64,
+    pub avg_current: f64,
+    pub resistors: usize,
+}
+
+pub fn get_em_solution(currents: &[(ConnId, f64)]) -> EmResults {
+    let mut r = EmResults::default();
+    let mut total_current = 0.0;
+    for &(_, current) in currents {
+        r.resistors += 1;
+        total_current += current;
+        // std::max: the first argument unless the second is strictly greater.
+        if r.max_current < current {
+            r.max_current = current;
+        }
+    }
+    if r.resistors > 0 {
+        r.avg_current = total_current / r.resistors as f64;
+    }
+    r
+}
+
+/// The EM report's lines (`reportEM`).
+pub fn em_report_lines(net: &str, corner: &str, r: &EmResults) -> Vec<String> {
+    vec![
+        "########## EM analysis ###############".to_string(),
+        format!("Net                : {net}"),
+        format!("Corner             : {corner}"),
+        format!("Maximum current    : {} A", fmt_e(r.max_current, 2)),
+        format!("Average current    : {} A", fmt_e(r.avg_current, 2)),
+        format!("Number of resistors: {}", r.resistors),
+        "######################################".to_string(),
+    ]
+}
+
+/// The EM file (`writeEMFile`): a header, then per connection of the current map, its two nodes'
+/// layers and locations in microns (4 places) and its current (3 places, exponent).
+pub fn em_file_lines(nw: &Network, dbus: i32, currents: &[(ConnId, f64)]) -> Vec<String> {
+    let dbus = f64::from(dbus);
+    let mut out = vec!["Node0 Layer,Node0 X location,Node0 Y location,Node1 Layer,Node1 X location,Node1 Y location,Current".to_string()];
+    for &(c, current) in currents {
+        let conn = &nw.conns[c];
+        let at = |n: Option<NodeId>| {
+            let node = &nw.arena[n.expect("a current map connection has both nodes")];
+            (nw.tech.layers[node.li].name.as_str(), node.pt)
+        };
+        out.push(em_line(at(conn.n0), at(conn.n1), dbus, current));
+    }
+    out
+}
+
+/// One connection's line.
+pub fn em_line(a: (&str, (i32, i32)), b: (&str, (i32, i32)), dbus: f64, current: f64) -> String {
+    let um = |v: i32| format!("{:.4}", f64::from(v) / dbus);
+    format!("{},{},{},{},{},{},{}", a.0, um(a.1 .0), um(a.1 .1), b.0, um(b.1 .0), um(b.1 .1), fmt_e(current, 3))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // getSolution's worst on a supply net is the LOWEST voltage, starting from the supply; on a
+    // ground net (supply 0) the HIGHEST, and the drop is the voltage itself. The average is the
+    // plain mean; the percentage is the worst drop over the power net's voltage.
+    #[test]
+    fn the_worst_voltage_is_the_lowest_on_supply_and_the_highest_on_ground() {
+        let ids: Vec<NodeId> = vec![0, 1, 2];
+        let nw = BTreeMap::from([(LayerKey { id: 1, li: 0 }, ids.clone())]);
+        let mut v = HashMap::new();
+        for (&id, x) in ids.iter().zip([1.0, 0.9, 0.95]) {
+            v.insert(id, x);
+        }
+        let r = get_solution(&nw, &v, 1.0, 2.0, 1.0).unwrap();
+        assert_eq!(r.worst_voltage, 0.9);
+        assert!((r.worst_ir_drop - 0.1).abs() < 1e-15);
+        assert!((r.avg_voltage - 0.95).abs() < 1e-15);
+        assert_eq!(r.max_percent, (100.0 * (1.0 - 0.9) / 1.0) as f32);
+        for (&id, x) in ids.iter().zip([0.0, 0.02, 0.01]) {
+            v.insert(id, x);
+        }
+        let g = get_solution(&nw, &v, 0.0, 2.0, 1.1).unwrap();
+        assert_eq!((g.worst_voltage, g.worst_ir_drop), (0.02, 0.02));
+        assert_eq!(g.max_percent, (100.0 * 0.02 / 1.1) as f32);
+        v.remove(&ids[1]);
+        assert_eq!(get_solution(&nw, &v, 0.0, 2.0, 1.1), None);
+    }
+
+    // The voltages are summed in node order, layer by layer: the sum is not associative, so the
+    // order is part of the average.
+    #[test]
+    fn the_average_sums_in_node_order() {
+        let xs = [1.0, 1e-16, 1e-16, -1.0];
+        // Layer 2's nodes come after layer 1's whatever their node ids.
+        let nw = BTreeMap::from([(LayerKey { id: 2, li: 1 }, vec![0, 1]), (LayerKey { id: 1, li: 0 }, vec![3, 2])]);
+        let v: HashMap<NodeId, f64> = HashMap::from([(3, xs[0]), (2, xs[1]), (0, xs[2]), (1, xs[3])]);
+        let r = get_solution(&nw, &v, 1.0, 0.0, 1.0).unwrap();
+        assert_eq!(r.avg_voltage, xs.iter().fold(0.0, |s, x| s + x) / 4.0);
+        assert_eq!(r.avg_voltage, 0.0);
+    }
+
+    // A terminal at (12345, 70) dbu in a 2000-per-micron design is at 6.1725, 0.0350 microns; the
+    // voltage keeps 6 places and the sign of a negative zero.
+    #[test]
+    fn a_voltage_line_prints_microns_and_volts_as_the_reference_formats_them() {
+        assert_eq!(voltage_line("_1_", "VDD", "metal1", (12345, 70), 2000.0, 1.0994961), "_1_,VDD,metal1,6.1725,0.0350,1.099496");
+        assert_eq!(voltage_line("u", "VSS", "M1", (0, -10), 1000.0, -0.0), "u,VSS,M1,0.0000,-0.0100,-0.000000");
+    }
+
+    // getEMSolution: the maximum is the largest current, the average their sum in map order over
+    // the count; no connections leave both zero.
+    #[test]
+    fn the_em_summary_is_the_largest_and_the_mean_in_map_order() {
+        let c = [(0, 1.0), (1, 1e-16), (2, 3.0), (3, 1e-16)];
+        let r = get_em_solution(&c);
+        assert_eq!(r, EmResults { max_current: 3.0, avg_current: (((1.0 + 1e-16) + 3.0) + 1e-16) / 4.0, resistors: 4 });
+        assert_eq!(get_em_solution(&[]), EmResults::default());
+        let l = em_report_lines("VSS", "default", &r);
+        assert_eq!(l[3], "Maximum current    : 3.00e+00 A");
+        assert_eq!(l[5], "Number of resistors: 4");
+    }
+
+    #[test]
+    fn an_em_line_prints_both_nodes_and_the_current() {
+        assert_eq!(em_line(("metal1", (100, 1400)), ("metal4", (100, 2800)), 2000.0, 1.23456e-5), "metal1,0.0500,0.7000,metal4,0.0500,1.4000,1.235e-05");
+    }
+
+    #[test]
+    fn the_report_prints_as_the_reference_formats_it() {
+        let r = IrResults { net_voltage: 1.1, worst_voltage: 1.1 - 5.04e-4, worst_ir_drop: 5.04e-4, avg_voltage: 1.1 - 3.13e-4, avg_ir_drop: 3.13e-4, max_percent: 0.0458, total_power: 1.38e-4 };
+        let l = report_lines("VDD", "default", &r);
+        assert_eq!(l[3], "Total power      : 1.38e-04 W");
+        assert_eq!(l[4], "Supply voltage   : 1.10e+00 V");
+        assert_eq!(l[8], "Worstcase IR drop: 5.04e-04 V");
+        assert_eq!(l[9], "Percentage drop  : 0.05 %");
+        assert_eq!(l.len(), 11);
+    }
 
     // The C++ exponent always carries a sign and at least two digits.
     // `stod` reads the longest numeric prefix after white space: " 1.5e3x" is 1500, "2." is 2,
