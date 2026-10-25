@@ -29,6 +29,12 @@ pub struct TimerInputs<'t> {
 
 /// `ensureActivities` over the design: the activity of every pin the propagation reached.
 pub fn activities(db: &Db, inp: &TimerInputs<'_>) -> Result<Activities, String> {
+    Ok(activities_and_powers(db, inp, None)?.0)
+}
+
+/// `ensureActivities`, then, for the scene given (`analyze_power_grid -corner`), `findInstPowers`:
+/// each instance with a liberty cell, by name, in instance order.
+pub fn activities_and_powers(db: &Db, inp: &TimerInputs<'_>, powers_scene: Option<usize>) -> Result<(Activities, Vec<(String, power::InstPower)>), String> {
     let mut liberty = vyges_est::liberty::LibertyClocks::default();
     let mut libs = Libs { scenes: inp.corners.to_vec(), scene_libs: vec![Vec::new(); inp.corners.len()], ..Libs::default() };
     for (corner, text) in inp.liberties {
@@ -65,17 +71,36 @@ pub fn activities(db: &Db, inp: &TimerInputs<'_>) -> Result<Activities, String> 
         [one] => one.as_str(),
         _ => return Err(format!("{} constraint files: one is modelled", inp.sdcs.len())),
     };
-    let s = vyges_loom::sdc::Sdc::parse(sdc_text).map_err(|e| format!("constraints: {e:?}"))?;
+    let mut s = vyges_loom::sdc::Sdc::parse(sdc_text).map_err(|e| format!("constraints: {e:?}"))?;
     let netlist = vyges_grt::timer::netlist(db);
     let constants = vyges_rsz::env::sim_constants(db, &liberty)?;
+    let mpins = vyges_rsz::env::master_pins(db)?;
+    let unlinked = unlinked_masters(db, &libs)?;
+    // A constraint names a pin by its path name (`get_pins {a.b[0]/IN}`), the database by its
+    // escaped name (`a\.b\[0\]/IN`): each clock source is resolved to the pin it names before the
+    // timer, the arrival search or the propagation reads it.
+    let mut by_path: HashMap<String, String> = netlist.ports.iter().map(|(p, _)| (power::path_name(p), p.clone())).collect();
+    for inst in &netlist.insts {
+        let (name, cell) = &**inst;
+        let pins = mpins.get(cell).cloned().or_else(|| unlinked.get(cell).map(|u| u.iter().map(|(p, _)| p.clone()).collect())).unwrap_or_default();
+        for p in pins {
+            let pin = format!("{name}/{p}");
+            by_path.insert(power::path_name(&pin), pin);
+        }
+    }
+    for c in &mut s.clocks {
+        for src in &mut c.sources {
+            if let Some(name) = by_path.get(src.as_str()) {
+                *src = name.clone();
+            }
+        }
+    }
     let clock_sources: Vec<String> = s.clocks.iter().filter(|c| !c.is_virtual()).flat_map(|c| c.sources.iter().cloned()).collect();
     let mut env = vyges_rsz::env::sdc_env(&s, &libs, &netlist)?;
     env.constants = constants;
-    let mpins = vyges_rsz::env::master_pins(db)?;
     let propagated = !s.propagated.is_empty();
     // One graph per scene, each timed with its own libraries: the slew bound reads every
     // analysis point. The propagation walks the first (every scene has the same graph).
-    let unlinked = unlinked_masters(db, &libs)?;
     let mut graphs = Vec::new();
     for k in 0..libs.scene_count() {
         let mut g = vyges_sta::graph::Graph::build_with_unlinked(libs.scene_slice(k), &netlist, Some(&mpins), &unlinked)?;
@@ -102,7 +127,29 @@ pub fn activities(db: &Db, inp: &TimerInputs<'_>) -> Result<Activities, String> 
     let min_rf_slew: Vec<f32> = (0..n).map(|v| graphs.iter().map(|gk| min_rf_slew(&gk.slew[v])).fold(f32::INFINITY, f32::min)).collect();
     let min_period = if ssdc.clocks.is_empty() { 0.0 } else { ssdc.clocks.iter().map(|c| c.period).fold(f32::INFINITY, f32::min) };
     let inputs = ActivityInputs { level: &level, clock_source: &clock_source, is_clock: &is_clock, clock: &clock, min_rf_slew: &min_rf_slew, min_period, time_unit: time_scale };
-    power::ensure_activities(g, &inputs)
+    let act = power::ensure_activities(g, &inputs)?;
+    let Some(k) = powers_scene else { return Ok((act, Vec::new())) };
+    if sdc_text.lines().any(|l| l.split_whitespace().next() == Some("set_clock_transition")) {
+        return Err("set_clock_transition (an ideal clock's slew) is not modelled".into());
+    }
+    let gk = graphs.get(k).ok_or_else(|| format!("scene {k} is not defined"))?;
+    // A pin's vertices: its first, then a bidirect pin's driver (same name).
+    let pin_drvr = |v: usize| -> Option<usize> {
+        if gk.vertices[v].is_driver {
+            Some(v)
+        } else {
+            gk.vertices.get(v + 1).filter(|w| w.is_driver && w.name == gk.vertices[v].name).map(|_| v + 1)
+        }
+    };
+    let no_parasitics = HashMap::new();
+    // `loadCap(pin, scene, max)` of each output pin: its pin loads and port loads, no wire.
+    let load_cap: Vec<f32> = (0..n).map(|v| pin_drvr(v).map_or(0.0, |d| gk.load_cap(d, &no_parasitics))).collect();
+    // `ClkNetwork::idealClkSlew`: without `set_clock_transition`, 0 on an ideal clock's pins.
+    let ideal_clock_slew: Vec<Option<[f32; 2]>> = (0..n).map(|v| (gk.ideal_clock.contains(&v) || pin_drvr(v).is_some_and(|d| gk.ideal_clock.contains(&d))).then_some([0.0; 2])).collect();
+    let pw = power::PowerInputs { constants: &gk.sdc.constants, ideal_clock_slew: &ideal_clock_slew, load_cap: &load_cap, link_libs: &libs.libs };
+    let found = power::inst_powers(gk, &inputs, &act, &pw)?;
+    let named = found.into_iter().enumerate().filter_map(|(i, p)| p.map(|p| (power::path_name(&netlist.insts[i].0), p))).collect();
+    Ok((act, named))
 }
 
 /// The masters no library holds, each with its signal terminals in order and their directions

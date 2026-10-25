@@ -29,9 +29,10 @@ USAGE:
                                                   the power grid as a SPICE netlist, with the currents
                                                   of the session's last analyze of the net
   vyges loom psm activities   <design.odb> [--corners C,C] --liberty FILE | --liberty-corner C FILE ...
-                                [--sdc FILE]
+                                [--sdc FILE] [--powers [--corner C]]
                                                   diagnostic: the timer's switching-activity propagation,
-                                                  each value set (IEEE bits), in the order it was set
+                                                  each value set (IEEE bits), in the order it was set;
+                                                  --powers: then each instance's power terms (IEEE bits)
   vyges loom psm --describe
   vyges loom psm --help
   vyges loom psm --version
@@ -412,9 +413,15 @@ fn analyze(args: &[String], spice: bool) -> ExitCode {
 /// `activities`: the instance power's activity propagation over the design, its trace printed.
 fn activities(args: &[String]) -> ExitCode {
     let (mut design, mut corners, mut liberties, mut sdcs) = (None::<String>, Vec::new(), Vec::new(), Vec::new());
+    let (mut powers, mut power_corner) = (false, None::<String>);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--powers" => powers = true,
+            "--corner" => match it.next() {
+                Some(c) => power_corner = Some(c.clone()),
+                None => return usage_error("--corner needs a corner"),
+            },
             "--corners" => match it.next() {
                 Some(c) => corners = c.split([',', ' ']).filter(|x| !x.is_empty()).map(String::from).collect(),
                 None => return usage_error("--corners needs a list"),
@@ -448,10 +455,22 @@ fn activities(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match vyges_psm::timer::activities(&db, &vyges_psm::timer::TimerInputs { corners: &corners, liberties: &liberties, sdcs: &sdcs }) {
-        Ok(a) => {
+    // `analyze_power_grid -corner`: that scene's instance powers; none, the first.
+    let scene = match &power_corner {
+        Some(c) => match corners.iter().position(|s| s == c) {
+            Some(k) => k,
+            None => return usage_error(&format!("--corner {c}: corner not defined")),
+        },
+        None => 0,
+    };
+    match vyges_psm::timer::activities_and_powers(&db, &vyges_psm::timer::TimerInputs { corners: &corners, liberties: &liberties, sdcs: &sdcs }, powers.then_some(scene)) {
+        Ok((a, p)) => {
             for l in &a.trace {
                 println!("{l}");
+            }
+            // Each term's float bits, as the reference's probe prints them.
+            for (name, r) in &p {
+                println!("VYG-POWER {name} internal {:08x} switching {:08x} leakage {:08x}", r.internal.to_bits(), r.switching.to_bits(), r.leakage.to_bits());
             }
             ExitCode::SUCCESS
         }
