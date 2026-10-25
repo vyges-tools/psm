@@ -6,8 +6,8 @@
 //!
 //! - the supply voltage of the last solve. It is kept even through a failed solve, and a LATER
 //!   solve of the same power net takes it as the power net's voltage before the user's setting;
-//! - the node voltages and whether the solve drew current. A solution is reusable
-//!   (`-allow_reuse`) only when it has both voltages and currents;
+//! - the node voltages and the node currents. A solution is reusable (`-allow_reuse`) only when
+//!   it has both; `write_pg_spice` needs only that the solve STARTED (its currents may be empty);
 //! - the total power, which the reused report prints.
 //!
 //! Any edit to the design drops every solution. Here the design's fingerprint (its file's bytes)
@@ -25,6 +25,8 @@ pub struct Solution {
     /// Reusable: the solve produced voltages and drew current.
     pub has_solution: bool,
     pub voltages: Vec<(NodeId, f64)>,
+    /// Each instance-terminal node's current, as the solve drew it.
+    pub currents: Vec<(NodeId, f64)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -33,11 +35,25 @@ pub struct Store {
     pub solutions: Vec<Solution>,
 }
 
-const MAGIC: &str = "vyges-psm-solutions 1";
+const MAGIC: &str = "vyges-psm-solutions 2";
 
 /// The design's fingerprint: FNV-1a over its bytes.
 pub fn fingerprint(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// `count` lines of `node value-bits`.
+fn pairs<'a>(lines: &mut impl Iterator<Item = &'a str>, count: &str) -> Result<Vec<(NodeId, f64)>, String> {
+    let bad = |what: &str| format!("malformed solution file: {what}");
+    let n: usize = count.parse().map_err(|_| bad("count"))?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let l = lines.next().ok_or_else(|| bad("node values"))?;
+        let (id, v) = l.split_once(' ').ok_or_else(|| bad("node value"))?;
+        let v = u64::from_str_radix(v, 16).map(f64::from_bits).map_err(|_| bad("value"))?;
+        out.push((id.parse().map_err(|_| bad("node"))?, v));
+    }
+    Ok(out)
 }
 
 impl Store {
@@ -61,13 +77,9 @@ impl Store {
                 return Err(bad("solution header"));
             }
             let hex64 = |s: &str| u64::from_str_radix(s, 16).map(f64::from_bits).map_err(|_| bad("value"));
-            let n: usize = n.parse().map_err(|_| bad("count"))?;
-            let mut voltages = Vec::with_capacity(n);
-            for _ in 0..n {
-                let l = lines.next().ok_or_else(|| bad("voltages"))?;
-                let (id, v) = l.split_once(' ').ok_or_else(|| bad("voltage"))?;
-                voltages.push((id.parse().map_err(|_| bad("node"))?, hex64(v)?));
-            }
+            let voltages = pairs(&mut lines, n)?;
+            let count = lines.next().and_then(|l| l.strip_prefix("currents ")).ok_or_else(|| bad("currents"))?;
+            let currents = pairs(&mut lines, count)?;
             store.solutions.push(Solution {
                 net: net.into(),
                 corner: corner.into(),
@@ -75,6 +87,7 @@ impl Store {
                 total_power: f32::from_bits(u32::from_str_radix(power, 16).map_err(|_| bad("power"))?),
                 has_solution: has == "1",
                 voltages,
+                currents,
             });
         }
         Ok(store)
@@ -96,6 +109,10 @@ impl Store {
             for (id, v) in &s.voltages {
                 out += &format!("{id} {:016x}\n", v.to_bits());
             }
+            out += &format!("currents {}\n", s.currents.len());
+            for (id, v) in &s.currents {
+                out += &format!("{id} {:016x}\n", v.to_bits());
+            }
         }
         out
     }
@@ -111,11 +128,13 @@ impl Store {
     }
 
     /// A solve has started: the net's voltages and currents on the corner are reset (no longer
-    /// reusable), but its supply voltage and power are kept until the solve stores new ones.
+    /// reusable; still present, so `write_pg_spice` writes no sinks rather than failing), but its
+    /// supply voltage and power are kept until the solve stores new ones.
     pub fn reset(&mut self, net: &str, corner: &str) {
         if let Some(s) = self.solutions.iter_mut().find(|s| s.net == net && s.corner == corner) {
             s.has_solution = false;
             s.voltages.clear();
+            s.currents.clear();
         }
     }
 }
@@ -125,7 +144,7 @@ mod tests {
     use super::*;
 
     fn sol(net: &str, v: f64) -> Solution {
-        Solution { net: net.into(), corner: "default".into(), src_voltage: 1.1, total_power: 1.38e-4, has_solution: true, voltages: vec![(3, v), (7, -0.0)] }
+        Solution { net: net.into(), corner: "default".into(), src_voltage: 1.1, total_power: 1.38e-4, has_solution: true, voltages: vec![(3, v), (7, -0.0)], currents: vec![(7, 2.5e-7)] }
     }
 
     // The file keeps every value to the bit (a negative zero included) and reads back as written.
@@ -156,7 +175,7 @@ mod tests {
         s.put(sol("VDD", 1.0));
         s.reset("VDD", "default");
         let e = s.get("VDD", "default").unwrap();
-        assert!(!e.has_solution && e.voltages.is_empty());
+        assert!(!e.has_solution && e.voltages.is_empty() && e.currents.is_empty());
         assert_eq!(e.src_voltage, 1.1);
         s.put(sol("VDD", 2.0));
         assert_eq!(s.solutions.len(), 1);

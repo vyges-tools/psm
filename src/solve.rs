@@ -1089,6 +1089,78 @@ pub fn voltage_line(inst: &str, term: &str, layer: &str, pt: (i32, i32), dbus: f
     format!("{inst},{term},{layer},{:.4},{:.4},{voltage:.6}", f64::from(pt.0) / dbus, f64::from(pt.1) / dbus)
 }
 
+// ---- SPICE -----------------------------------------------------------------------------------
+
+/// The SPICE spelling of a node: its type without spaces, layer and point (`Node_metal1_100_1400`).
+pub fn spice_node_name(nw: &Network, n: NodeId) -> String {
+    let node = &nw.arena[n];
+    spice_name(node.kind, &nw.tech.layers[node.li].name, node.pt)
+}
+
+/// `Node::getName`: the type's name with its spaces removed, the layer, the point in database units.
+pub fn spice_name(kind: NodeKind, layer: &str, pt: (i32, i32)) -> String {
+    let kind = match kind {
+        NodeKind::Node => "Node",
+        NodeKind::ITerm { .. } => "ITermNode",
+        NodeKind::BPin { .. } => "BPinNode",
+    };
+    format!("{kind}_{layer}_{}_{}", pt.0, pt.1)
+}
+
+/// A sink's current as written (3 places), or `None` below [`SPICE_FILE_MIN_CURRENT`] in magnitude.
+pub fn sink_current(current: f64) -> Option<String> {
+    (current.abs() >= SPICE_FILE_MIN_CURRENT).then(|| fmt_e(current, 3))
+}
+
+/// Currents smaller than this are not written as sinks.
+pub const SPICE_FILE_MIN_CURRENT: f64 = 1e-18;
+
+/// The SPICE file (`writeSpiceFile`): a resistor per network connection in the network's order
+/// (6 places), a current sink per instance-terminal node in network order that draws at least
+/// [`SPICE_FILE_MIN_CURRENT`] (3 places), a voltage source per source the generator found, in
+/// its order (6 places, fixed), then the footer.
+#[allow(clippy::too_many_arguments)]
+pub fn spice_lines(
+    nw: &Network,
+    net_input: &NetInput,
+    net: &str,
+    corner: &str,
+    res: &[f64],
+    currents: &HashMap<NodeId, f64>,
+    srcs: &Sources,
+    found: &[usize],
+    src_voltage: f64,
+) -> Vec<String> {
+    let mut out = vec![format!("* Netlist for {net} on {corner}"), String::new(), "* Resistive network".to_string()];
+    for (i, &c) in nw.connections.iter().enumerate() {
+        let conn = &nw.conns[c];
+        let name = |n: Option<NodeId>| n.map_or_else(String::new, |n| spice_node_name(nw, n));
+        out.push(format!("R{i} {} {} R={}", name(conn.n0), name(conn.n1), fmt_e(connection_resistance(nw, c, res), 6)));
+    }
+    out.extend([String::new(), "* Sinks".to_string()]);
+    let mut current_number = 0;
+    for &n in &nw.iterm_nodes {
+        // An instance that draws no power (a filler, tap, decap) has no current at all.
+        let Some(text) = currents.get(&n).and_then(|&c| sink_current(c)) else { continue };
+        let NodeKind::ITerm { iterm, .. } = nw.arena[n].kind else { continue };
+        out.push(format!("* Sink for {}", net_input.iterms[iterm].name));
+        out.push(format!("I{current_number} {} 0 DC {text}", spice_node_name(nw, n)));
+        current_number += 1;
+    }
+    out.extend([String::new(), "* Sources".to_string()]);
+    for (i, &s) in found.iter().enumerate() {
+        let name = match srcs.nodes[s].source {
+            MNode::Net(n) => spice_node_name(nw, n),
+            MNode::Src(_) => String::new(),
+        };
+        out.push(format!("V{i} {name} 0 DC {src_voltage:.6}"));
+    }
+    out.extend(
+        ["", "* Footer", ".OPTION NUMDGT=6", ".OP", ".SAVE TYPE=IC FILE=compare.ic", ".END", ""].map(String::from),
+    );
+    out
+}
+
 // ---- electromigration -----------------------------------------------------------------------
 
 /// Each connection's current (`generateCurrentMap`): the conductance map's keys in its order, less
@@ -1237,6 +1309,24 @@ mod tests {
     #[test]
     fn an_em_line_prints_both_nodes_and_the_current() {
         assert_eq!(em_line(("metal1", (100, 1400)), ("metal4", (100, 2800)), 2000.0, 1.23456e-5), "metal1,0.0500,0.7000,metal4,0.0500,1.4000,1.235e-05");
+    }
+
+    // Node names drop the spaces of the type name ("ITerm Node" -> ITermNode); a terminal node
+    // spells as a plain node.
+    #[test]
+    fn spice_names_drop_the_spaces_of_the_type() {
+        assert_eq!(spice_name(NodeKind::Node, "metal1", (100, -1400)), "Node_metal1_100_-1400");
+        assert_eq!(spice_name(NodeKind::ITerm { iterm: 0, id: 3 }, "metal1", (0, 0)), "ITermNode_metal1_0_0");
+        assert_eq!(spice_name(NodeKind::BPin { id: 1, disconnect: false }, "metal7", (5, 6)), "BPinNode_metal7_5_6");
+    }
+
+    // A sink is written when its current's magnitude is at least 1e-18 (a negative one too).
+    #[test]
+    fn sinks_below_the_minimum_current_are_dropped() {
+        assert_eq!(sink_current(1e-18).as_deref(), Some("1.000e-18"));
+        assert_eq!(sink_current(-2.5e-7).as_deref(), Some("-2.500e-07"));
+        assert_eq!(sink_current(9.99e-19), None);
+        assert_eq!(sink_current(0.0), None);
     }
 
     #[test]

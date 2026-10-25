@@ -25,7 +25,9 @@ USAGE:
   vyges loom psm analyze      <design.odb> --net NET [--voltage-file FILE] [--enable-em [--em-file FILE]]
                                 [--save-solution FILE [--allow-reuse]] [--dump-dir DIR]
                                                   static IR drop: per-node voltages, worst and average drop
-  vyges loom psm write-spice  <design.odb> <job>  write the power grid as a SPICE netlist
+  vyges loom psm write-spice  <design.odb> <file> --net NET --save-solution FILE [--vsrc FILE]
+                                                  the power grid as a SPICE netlist, with the currents
+                                                  of the session's last analyze of the net
   vyges loom psm --describe
   vyges loom psm --help
   vyges loom psm --version
@@ -57,7 +59,7 @@ EXIT STATUS:
   3  refused — this build does not implement the command yet
 ";
 
-/// The commands this engine will answer. `check` is built; the others refuse (exit 3).
+/// The commands this engine will answer.
 pub const COMMANDS: &[&str] = &["check", "analyze", "write-spice"];
 
 const DESCRIBE: &str = r#"{
@@ -68,7 +70,7 @@ const DESCRIBE: &str = r#"{
   "provenance_limitations": [
     "check: an error file holding a short whose overlap is not one rectangle refuses (exit 3).",
     "check refuses (exit 3) on an octilinear special wire of another net, a pin layer mixing a polygon off the Manhattan grid with other metal, and an off-grid obstruction polygon.",
-    "analyze is built end to end; a solution is kept between calls only through --save-solution; write-spice refuses with exit 3."
+    "analyze and write-spice are built end to end; a solution is kept between calls only through --save-solution (write-spice reads it)."
   ],
   "invocation": { "args_template": ["check"], "emits_json": true },
   "inputs": { "type": "object", "properties": {} },
@@ -102,7 +104,8 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("check") => check(&args[1..]),
-        Some("analyze") => analyze(&args[1..]),
+        Some("analyze") => analyze(&args[1..], false),
+        Some("write-spice") => analyze(&args[1..], true),
         Some(cmd) if COMMANDS.contains(&cmd) => refuse(cmd),
         Some(other) => {
             eprintln!("vyges-psm: unknown command `{other}`\n\n{USAGE}");
@@ -281,8 +284,9 @@ struct AnalyzeOpts {
 /// `analyze`: the connectivity check (terminals not required, not floorplanning), then the solve in
 /// its order: the solve (or, with `--allow-reuse`, the saved solution of this net and corner), its
 /// report, EM, the instance voltage file.
-fn analyze(args: &[String]) -> ExitCode {
+fn analyze(args: &[String], spice: bool) -> ExitCode {
     let (mut design, mut net, mut dump_dir, mut error_file) = (None, None, None, None);
+    let mut spice_file = None::<String>;
     let (mut voltage_file, mut enable_em, mut em_file) = (None, false, None::<String>);
     let (mut save_solution, mut allow_reuse) = (None::<String>, false);
     let mut o = AnalyzeOpts::default();
@@ -311,6 +315,7 @@ fn analyze(args: &[String]) -> ExitCode {
                 "--allow-reuse" => allow_reuse = true,
                 v if v.starts_with('-') => return Err(usage_error(&format!("unknown option `{v}`"))),
                 v if design.is_none() => design = Some(v.to_string()),
+                v if spice && spice_file.is_none() => spice_file = Some(v.to_string()),
                 v => return Err(usage_error(&format!("unexpected argument `{v}`"))),
             }
             Ok(())
@@ -320,6 +325,9 @@ fn analyze(args: &[String]) -> ExitCode {
         }
     }
     let (Some(design), Some(net)) = (design, net) else { return usage_error("analyze needs <design.odb> and --net") };
+    if spice && spice_file.is_none() {
+        return usage_error("write-spice needs <design.odb> <spice file>");
+    }
     if em_file.is_some() && !enable_em {
         return fail(&["[ERROR PSM-0055] EM file cannot be specified without enabling em analysis.".to_string()]);
     }
@@ -346,6 +354,9 @@ fn analyze(args: &[String]) -> ExitCode {
         Ok(s) => s,
         Err(code) => return code,
     };
+    if let Some(path) = spice_file {
+        return write_spice(&db, &design, &net, &tech, &net_input, &inputs, &session, &o, save_solution.as_deref(), &path);
+    }
     let opts = Connectivity { floorplanning: false, require_bterm: false, stats: false, dump_dir: dump_dir.clone(), error_file };
     let network = match check_connectivity(&db, &tech, &net_input, &opts) {
         Ok(n) => n,
@@ -389,6 +400,82 @@ fn analyze(args: &[String]) -> ExitCode {
         if std::fs::write(&path, text).is_err() {
             return fail(&[format!("[ERROR PSM-0090] Unable to open {path} to write instance voltage file")]);
         }
+    }
+    ExitCode::SUCCESS
+}
+
+/// `write-spice` (`writeSpiceFile`): the net's network as constructed (no check), written with the
+/// currents of the session's last solve of this net and corner — PSM-0092 when there was none —
+/// and the sources generated again (their log lines printed again), at the net's voltage.
+#[allow(clippy::too_many_arguments)]
+fn write_spice(
+    db: &vyges_opendb::Db,
+    design: &str,
+    net: &str,
+    tech: &vyges_psm::input::Tech,
+    net_input: &vyges_psm::input::NetInput,
+    inputs: &vyges_psm::solve::SolveInputs,
+    session: &Session,
+    o: &AnalyzeOpts,
+    save_solution: Option<&str>,
+    path: &str,
+) -> ExitCode {
+    use vyges_psm::solve;
+    let store = match save_solution {
+        Some(p) => match load_store(p, design) {
+            Ok(s) => Some(s),
+            Err(code) => return code,
+        },
+        None => None,
+    };
+    let Some(solution) = store.as_ref().and_then(|s| s.get(net, &session.corner)) else {
+        return fail(&[format!("[ERROR PSM-0092] No solution available for {net} on corner {}. Run analyze_power_grid first.", session.corner)]);
+    };
+    // The file is opened (emptied) before anything is computed, as the reference's stream is.
+    let Ok(mut file) = std::fs::File::create(path) else {
+        return fail(&[format!("[ERROR PSM-0041] Could not open {path} to write spice file")]);
+    };
+    let network = match vyges_psm::network::Network::build(tech, net_input, false, None) {
+        Ok((n, _)) => n,
+        Err(e) => {
+            println!("[ERROR PSM-0087] {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let c = Call { net, net_id: db.net_id(net).unwrap_or(0), tech, net_input, inputs, session, o, network: &network, dump_dir: None };
+    let res = match resistances(&c) {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    let previous = Some(solution.src_voltage);
+    let power_voltage = || solve::power_net_voltage(inputs.sig, c.net_id, &session.voltages, &session.corner, previous, session.pvt);
+    let Some(net_voltage) = solve::net_voltage(inputs.sig, power_voltage) else {
+        return fail(&[format!("[ERROR PSM-0079] Cannot determine the supply voltage for {net}.")]);
+    };
+    let mut srcs = solve::Sources::default();
+    let mut log = solve::SourceLog::default();
+    let found = solve::generate_source_nodes(&network, inputs, &session.settings, session.source_type, o.vsrc.as_deref(), net_voltage, &mut srcs, &mut log);
+    let currents: std::collections::HashMap<_, _> = solution.currents.iter().copied().collect();
+    use std::io::Write;
+    let (found, src_voltage) = match found {
+        Ok(x) => x,
+        Err(lines) => {
+            // The reference's stream already holds everything through "* Sources" when the
+            // source generator fails; that much of the file is left behind.
+            let all = solve::spice_lines(&network, net_input, net, &session.corner, &res, &currents, &srcs, &[], 0.0);
+            let upto = all.iter().position(|l| l == "* Sources").map_or(all.len(), |i| i + 1);
+            let _ = file.write_all(format!("{}\n", all[..upto].join("\n")).as_bytes());
+            return fail(&lines);
+        }
+    };
+    for l in &log.lines {
+        println!("{l}");
+    }
+    let lines = solve::spice_lines(&network, net_input, net, &session.corner, &res, &currents, &srcs, &found, src_voltage);
+    // Every line ends in a newline, the footer's closing empty line too.
+    if file.write_all(format!("{}\n", lines.join("\n")).as_bytes()).is_err() {
+        eprintln!("vyges-psm: cannot write {path}");
+        return ExitCode::from(2);
     }
     ExitCode::SUCCESS
 }
@@ -519,6 +606,11 @@ fn solve_net(c: &Call, store: &mut Option<vyges_psm::solution::Store>, save: Opt
             total_power,
             has_solution: !voltages.is_empty() && !currents.is_empty(),
             voltages: kept,
+            currents: {
+                let mut c: Vec<(vyges_psm::network::NodeId, f64)> = currents.iter().map(|(&k, &x)| (k, x)).collect();
+                c.sort_by_key(|p| p.0);
+                c
+            },
         });
     }
     save_store(store, save)?;
