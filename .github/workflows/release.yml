@@ -74,7 +74,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        # macOS: put the (keg-only, newer) brew bison ahead of the 2.x system one — the LEF/DEF
+        # parsers in the database library do not build with bison 2.3.
+        run: |
+          [ "${{ runner.os }}" = "macOS" ] && export PATH="$(brew --prefix bison)/bin:$PATH"
+          cargo build --release --target ${{ matrix.target }}
       - name: Package
         shell: bash
         run: |
