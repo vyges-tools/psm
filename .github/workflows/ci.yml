@@ -4,7 +4,9 @@
 # repo's own `on:` triggers and requires every one green at HEAD, so a repo with no push-triggered
 # workflow is reported as "not gated" — which reads like a pass and is actually "nobody looked".
 #
-# Actions are enabled on this repository when it is made public.
+# The engine reads and writes the design database through vyges-opendb, which statically links
+# libodb (C++, built from source), Hence the sibling
+# layout below and a C toolchain.
 name: ci
 
 on:
@@ -20,12 +22,44 @@ jobs:
   build-test:
     name: build & test
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vyges-tools-psm
     steps:
       - uses: actions/checkout@v7
+        with:
+          path: vyges-tools-psm
+      # Every [patch] path in Cargo.toml must resolve: a missing one is a hard `failed to load
+      # source`, not a fall-back to the git source.
+      - name: Sibling checkouts
+        working-directory: .
+        run: |
+          set -eu
+          ref=main
+          for r in sta opendb opendb-lib sparselu rsz grt est stt dpl drt loom; do
+            git clone -q --depth 1 --branch "$ref" "https://github.com/vyges-tools/$r" "vyges-tools-$r"
+            echo "vyges-tools-$r @ $ref $(git -C vyges-tools-$r rev-parse --short HEAD)"
+          done
+
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ git bison libboost-dev libboost-iostreams-dev libbz2-dev zlib1g-dev
+
+
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # No --locked: the [patch] resolves the sibling crates to the checkouts @ main, which the
+      # committed lock file cannot know — let Cargo resolve.
       - name: Build
-        run: cargo build --locked --verbose
+        run: cargo build --release --verbose
       - name: Test
-        run: cargo test --locked --verbose
+        run: cargo test --release --verbose
       - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --release --all-targets -- -D warnings
+      - name: Smoke the contract
+        run: |
+          ./target/release/vyges-psm --version
+          ./target/release/vyges-psm --describe | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["name"]=="psm", d'

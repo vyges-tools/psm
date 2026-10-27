@@ -1,14 +1,14 @@
 # Matrix multi-platform release build.
 #
-# Produces vyges-stt-<rust-triple>.tar.gz assets whose names match what the vyges CLI expects:
-# install_one() fetches `vyges-stt-<target>.tar.gz` from
-# github.com/vyges-tools/stt/releases/latest/download/ and extracts a `vyges-stt` binary.
+# Produces vyges-psm-<rust-triple>.tar.gz assets whose names match what the vyges CLI expects.
+# The engine also ships inside the `vyges-physical` suite binary (vyges-tools/suite).
 #
 # ⛔ The CLI's `released:` flag for this engine flips on the ASSETS, not on the tag. `true` with
 # nothing published promises a download that 404s; `false` once a release exists denies one that
 # is there.
-# Triggers: a pushed tag `v*` (the tag IS the release), or a manual run with an
-# explicit tag input. The tag is read from inputs.tag (dispatch) or the ref (push).
+# Triggers: a pushed tag `v*` (the tag IS the release), or a manual run with an explicit tag
+# input. Every sibling is checked out AT THE SAME TAG, so the binary is built from exactly the
+# sources released under it.
 name: release
 
 on:
@@ -29,20 +29,47 @@ jobs:
   build:
     name: build · ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: vyges-tools-psm
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: macos-14,        target: aarch64-apple-darwin }
+          - { os: macos-15,        target: aarch64-apple-darwin }
           - { os: ubuntu-latest,   target: x86_64-unknown-linux-gnu }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
     steps:
       - uses: actions/checkout@v7
+        with:
+          path: vyges-tools-psm
       - name: Tag matches crate version
         run: |
           want="${{ inputs.tag || github.ref_name }}"; want="${want#v}"
           have="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
           [ "$want" = "$have" ] || { echo "::error::tag v$want != Cargo.toml version $have — bump [package] version"; exit 1; }
+      # Every [patch] path in Cargo.toml must resolve: a missing one is a hard `failed to load
+      # source`, not a fall-back to the git source.
+      - name: Sibling checkouts
+        working-directory: .
+        run: |
+          set -eu
+          ref="${{ inputs.tag || github.ref_name }}"
+          for r in sta opendb opendb-lib sparselu rsz grt est stt dpl drt loom; do
+            git clone -q --depth 1 --branch "$ref" "https://github.com/vyges-tools/$r" "vyges-tools-$r"
+            echo "vyges-tools-$r @ $ref $(git -C vyges-tools-$r rev-parse --short HEAD)"
+          done
+
+      - name: Toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ git bison libboost-dev libboost-iostreams-dev libbz2-dev zlib1g-dev
+      - name: Toolchain (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake boost bison
+
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -51,12 +78,12 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          bin="vyges-${GITHUB_REPOSITORY##*/}"
+          bin=vyges-psm
           stage="${bin}-${{ matrix.target }}"
           mkdir -p "$stage"
           cp "target/${{ matrix.target }}/release/${bin}" "$stage/"
           cp README.md LICENSE NOTICE "$stage/"
-          tar -czf "${stage}.tar.gz" "$stage"
+          tar -czf "$GITHUB_WORKSPACE/${stage}.tar.gz" "$stage"
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
