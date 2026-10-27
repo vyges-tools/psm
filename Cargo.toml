@@ -38,6 +38,9 @@ vyges-loom = { git = "https://github.com/vyges-tools/loom.git", branch = "main",
 [features]
 default = ["odb"]
 odb = ["dep:vyges-opendb", "dep:vyges-rsz", "dep:vyges-grt", "dep:vyges-est", "dep:vyges-loom"]
+# The command-line entry built into the library too (`cli_main`), for the suite binaries
+# that link every engine and run the one they are invoked as.
+suite = ["odb"]
 
 [[bin]]
 name = "vyges-psm"

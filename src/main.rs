@@ -16,26 +16,26 @@
 use std::process::ExitCode;
 
 const USAGE: &str = "\
-vyges loom psm — power-grid analysis on the design database: connectivity check, static IR drop, per-node voltages, SPICE export
+vyges physical psm — power-grid analysis on the design database: connectivity check, static IR drop, per-node voltages, SPICE export
 
 USAGE:
-  vyges loom psm check        <design.odb> --net NET [--floorplanning] [--dont-require-terminals]
+  vyges physical psm check        <design.odb> --net NET [--floorplanning] [--dont-require-terminals]
                                 [--error-file FILE] [--dump-dir DIR] [--stats]
                                                   every power/ground shape and instance pin reaches a supply
-  vyges loom psm analyze      <design.odb> --net NET [--voltage-file FILE] [--enable-em [--em-file FILE]]
+  vyges physical psm analyze      <design.odb> --net NET [--voltage-file FILE] [--enable-em [--em-file FILE]]
                                 [--save-solution FILE [--allow-reuse]] [--dump-dir DIR]
                                                   static IR drop: per-node voltages, worst and average drop
-  vyges loom psm write-spice  <design.odb> <file> --net NET --save-solution FILE [--vsrc FILE]
+  vyges physical psm write-spice  <design.odb> <file> --net NET --save-solution FILE [--vsrc FILE]
                                                   the power grid as a SPICE netlist, with the currents
                                                   of the session's last analyze of the net
-  vyges loom psm activities   <design.odb> [--corners C,C] --liberty FILE | --liberty-corner C FILE ...
+  vyges physical psm activities   <design.odb> [--corners C,C] --liberty FILE | --liberty-corner C FILE ...
                                 [--sdc FILE] [--powers [--corner C]]
                                                   diagnostic: the timer's switching-activity propagation,
                                                   each value set (IEEE bits), in the order it was set;
                                                   --powers: then each instance's power terms (IEEE bits)
-  vyges loom psm --describe
-  vyges loom psm --help
-  vyges loom psm --version
+  vyges physical psm --describe
+  vyges physical psm --help
+  vyges physical psm --version
 
 OPTIONS:
   --net NET             the supply net to analyse
@@ -92,7 +92,7 @@ fn refuse(what: &str) -> ExitCode {
     ExitCode::from(3)
 }
 
-fn main() -> ExitCode {
+pub fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None | Some("-h") | Some("--help") => {
@@ -934,7 +934,7 @@ mod tests {
     fn the_usage_spells_the_engine_under_its_group() {
         // The dispatcher REFUSES a wrong group prefix, so the help must spell the right one.
         for c in COMMANDS {
-            assert!(USAGE.contains(&format!("vyges loom psm {c}")), "{c}");
+            assert!(USAGE.contains(&format!("vyges physical psm {c}")), "{c}");
         }
     }
 }
