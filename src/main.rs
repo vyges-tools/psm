@@ -75,13 +75,46 @@ const DESCRIBE: &str = r#"{
   "provenance_limitations": [
     "check: an error file holding a short whose overlap is not one rectangle refuses (exit 3).",
     "check refuses (exit 3) on an octilinear special wire of another net, a pin layer mixing a polygon off the Manhattan grid with other metal, and an off-grid obstruction polygon.",
-    "analyze and write-spice are built end to end; a solution is kept between calls only through --save-solution (write-spice reads it)."
+    "analyze and write-spice are built end to end; a solution is kept between calls only through --save-solution (write-spice reads it).",
+    "The described call is `analyze`: the net's connectivity checked, then its static IR drop solved and the IR report printed (supply voltage, worst and average voltage, worst and average drop, percentage drop).",
+    "Instance power is an INPUT: analyze does not compute it from the Liberty and constraints. Without `inst_power` or `user_power` the total power is 0 W and so is the drop. `liberty` gives the supply voltage (its nominal voltage) and the RC units; without it or `net_voltage` the supply voltage is unknown and analyze stops (PSM-0079, exit 1).",
+    "`analyze` prints its report; it has no --json output (a --json is refused as an unknown option, exit 2), so emits_json is false and the result is the printed report.",
+    "analyze sets no IR-drop or current limit, so it establishes no pass/fail claim: the assertion is not_applicable. A net whose shapes are not all connected stops the call with exit 1 (PSM-0069) before any solve. EM reporting, a saved solution and repeated `net_voltage` or `user_power` entries need the engine's own arguments.",
+    "input_hash covers the argument vector, not the content of the database, source, power or Liberty files it names."
   ],
-  "invocation": { "args_template": ["check"], "emits_json": true },
-  "inputs": { "type": "object", "properties": {} },
-  "artifacts": [],
-  "assertion": { "id": "psm-ok", "field": "status", "pass_when": { "eq": "ok" } },
-  "consumes": []
+  "invocation": {
+    "args_template": ["analyze", "{design}", "--net", "{net}"],
+    "optional": [
+      { "arg": "inst_power", "flag": "--inst-power" },
+      { "arg": "user_power", "flag": "--user-power" },
+      { "arg": "liberty", "flag": "--liberty" },
+      { "arg": "net_voltage", "flag": "--net-voltage" },
+      { "arg": "vsrc", "flag": "--vsrc" },
+      { "arg": "source_type", "flag": "--source-type" },
+      { "arg": "corner", "flag": "--corner" },
+      { "arg": "voltage_file", "flag": "--voltage-file" }
+    ],
+    "emits_json": false
+  },
+  "inputs": {
+    "type": "object",
+    "required": ["design", "net"],
+    "properties": {
+      "design": { "type": "string", "description": "design database (.odb) holding the power grid" },
+      "net": { "type": "string", "description": "supply net to analyse, e.g. VDD" },
+      "inst_power": { "type": "string", "description": "file of per-instance power, one `INSTANCE WATTS` pair per line" },
+      "user_power": { "type": "string", "description": "one instance's power as INST=WATTS[@CORNER]" },
+      "liberty": { "type": "string", "description": "Liberty library (.lib, may be gzipped): the supply voltage and RC units" },
+      "net_voltage": { "type": "string", "description": "a supply net's voltage as NET=VOLTS[@CORNER], overriding the Liberty's" },
+      "vsrc": { "type": "string", "description": "voltage-source location file (it also gives the source voltage); without it the sources are the net's block-terminal pins, else generated as source_type says" },
+      "source_type": { "type": "string", "enum": ["FULL", "STRAPS", "BUMPS"], "description": "the generated source pattern when there is no vsrc and the net has no block-terminal pins (default BUMPS)" },
+      "corner": { "type": "string", "description": "corner name (default: default)" },
+      "voltage_file": { "type": "string", "description": "CSV file to write each instance terminal's voltage to" }
+    }
+  },
+  "artifacts": [ { "role": "instance_voltages", "from_arg": "voltage_file" } ],
+  "assertion": { "id": "ir-drop-reported", "not_applicable": true },
+  "consumes": ["odb", "liberty", "instance_power"]
 }"#;
 
 fn refuse(what: &str) -> ExitCode {
@@ -94,6 +127,11 @@ fn refuse(what: &str) -> ExitCode {
 
 pub fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    dispatch(&args)
+}
+
+/// The command named first, run on the rest.
+fn dispatch(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         None | Some("-h") | Some("--help") => {
             print!("{USAGE}");
@@ -926,8 +964,38 @@ mod tests {
         // Anything else is read as `discovered` and every verdict becomes `unknown`.
         let m = d["maturity"].as_str().unwrap();
         assert!(["discovered", "structured", "workflow-validated"].contains(&m), "{m}");
-        // `eq` is the schema's predicate; `equals` is dropped at runtime and the verdict is unknown.
-        assert_eq!(d["assertion"]["pass_when"]["eq"], "ok");
+        // analyze applies no limit: it makes no claim a verdict could be read from.
+        assert_eq!(d["assertion"]["not_applicable"], true);
+
+        // Rule: the command an MCP caller is handed is one this build answers. Called with no
+        // arguments a built command is a usage error (2); a refused one is exit 3.
+        let inv = &d["invocation"];
+        let template: Vec<&str> = inv["args_template"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
+        assert!(COMMANDS.contains(&template[0]), "{}", template[0]);
+        assert_ne!(dispatch(&[template[0].to_string()]), ExitCode::from(3), "`{}` is refused", template[0]);
+        // The command takes no --json (an unknown option, exit 2), so none may be appended.
+        assert_eq!(inv["emits_json"], false);
+        // Rule: a `{token}` is a required input, and every optional is a declared input.
+        let props = d["inputs"]["properties"].as_object().unwrap();
+        let required: Vec<&str> = d["inputs"]["required"].as_array().expect("inputs name their required parameters").iter().map(|r| r.as_str().unwrap()).collect();
+        let tokens: Vec<&str> = template.iter().filter_map(|t| t.strip_prefix('{').and_then(|t| t.strip_suffix('}'))).collect();
+        assert!(!tokens.is_empty(), "the command needs its inputs");
+        for t in &tokens {
+            assert!(required.contains(t) && props.contains_key(*t), "{t}");
+        }
+        for r in &required {
+            assert!(tokens.contains(r), "required `{r}` is never passed");
+        }
+        for o in inv["optional"].as_array().into_iter().flatten() {
+            assert!(props.contains_key(o["arg"].as_str().unwrap()) && o["flag"].is_string(), "{o}");
+        }
+        // Rule: an artifact without `field`/`from_arg` is dropped by the registry without a word.
+        let artifacts = d["artifacts"].as_array().unwrap();
+        assert!(!artifacts.is_empty(), "the voltage file is the one file the call can write");
+        for a in artifacts {
+            assert!(a["role"].is_string() && a["from_arg"].as_str().is_some_and(|f| props.contains_key(f)), "{a}");
+        }
+        assert!(!d["consumes"].as_array().unwrap().is_empty());
     }
 
     #[test]
