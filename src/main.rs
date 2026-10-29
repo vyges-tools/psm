@@ -24,7 +24,11 @@ USAGE:
                                                   every power/ground shape and instance pin reaches a supply
   vyges physical psm analyze      <design.odb> --net NET [--voltage-file FILE] [--enable-em [--em-file FILE]]
                                 [--save-solution FILE [--allow-reuse]] [--dump-dir DIR]
-                                                  static IR drop: per-node voltages, worst and average drop
+                                [--corners C,C] [--liberty FILE | --liberty-corner C FILE ...] [--sdc FILE]
+                                [--corner C] [--inst-power FILE]
+                                                  static IR drop: per-node voltages, worst and average drop;
+                                                  each instance's power from the timer on the libraries
+                                                  and constraints
   vyges physical psm write-spice  <design.odb> <file> --net NET --save-solution FILE [--vsrc FILE]
                                                   the power grid as a SPICE netlist, with the currents
                                                   of the session's last analyze of the net
@@ -47,6 +51,11 @@ OPTIONS:
   --em-file FILE        analyze: with --enable-em, write each connection's current (CSV)
   --save-solution FILE  analyze: the session's solutions, kept between calls (read, then updated)
   --allow-reuse         analyze: report the saved solution of this net and corner instead of solving
+  --liberty FILE        a Liberty library, in read order (gzip read); --liberty-corner C FILE: for corner C only
+  --sdc FILE            analyze: the constraints the instance power is timed under (clocks, activities)
+  --corners C,C         analyze: the corners defined (define_corners); --corner C: the one analysed
+  --inst-power FILE     analyze: each instance's power given (`INSTANCE WATTS` per line) instead of the
+                        timer's: a diagnostic
   --dump-dir DIR        write the network after each construction stage (psm_<stage>.txt) to DIR
   --stats               print the network's shape, node and connection counts
   -o FILE               write the report (or the output database) to FILE
@@ -77,7 +86,7 @@ const DESCRIBE: &str = r#"{
     "check refuses (exit 3) on an octilinear special wire of another net, a pin layer mixing a polygon off the Manhattan grid with other metal, and an off-grid obstruction polygon.",
     "analyze and write-spice are built end to end; a solution is kept between calls only through --save-solution (write-spice reads it).",
     "The described call is `analyze`: the net's connectivity checked, then its static IR drop solved and the IR report printed (supply voltage, worst and average voltage, worst and average drop, percentage drop).",
-    "Instance power is an INPUT: analyze does not compute it from the Liberty and constraints. Without `inst_power` or `user_power` the total power is 0 W and so is the drop. `liberty` gives the supply voltage (its nominal voltage) and the RC units; without it or `net_voltage` the supply voltage is unknown and analyze stops (PSM-0079, exit 1).",
+    "Instance power is computed by the timer from `liberty` and `sdc` (switching activity propagated from the clocks and the default input activity, then internal, switching and leakage power per instance), as the solve needs it. Without `liberty` no instance has a liberty cell and the power is `user_power` alone. A timer this build does not reproduce (liberty k_ scale factors, set_clock_transition, more than one constraints file) refuses (exit 3) rather than solving at 0 W. `inst_power` replaces the timer's power with the file's, for diagnosis. `liberty` also gives the supply voltage (its nominal voltage) and the RC units; without it or `net_voltage` the supply voltage is unknown and analyze stops (PSM-0079, exit 1).",
     "`analyze` prints its report; it has no --json output (a --json is refused as an unknown option, exit 2), so emits_json is false and the result is the printed report.",
     "analyze sets no IR-drop or current limit, so it establishes no pass/fail claim: the assertion is not_applicable. A net whose shapes are not all connected stops the call with exit 1 (PSM-0069) before any solve. EM reporting, a saved solution and repeated `net_voltage` or `user_power` entries need the engine's own arguments.",
     "input_hash covers the argument vector, not the content of the database, source, power or Liberty files it names."
@@ -88,6 +97,7 @@ const DESCRIBE: &str = r#"{
       { "arg": "inst_power", "flag": "--inst-power" },
       { "arg": "user_power", "flag": "--user-power" },
       { "arg": "liberty", "flag": "--liberty" },
+      { "arg": "sdc", "flag": "--sdc" },
       { "arg": "net_voltage", "flag": "--net-voltage" },
       { "arg": "vsrc", "flag": "--vsrc" },
       { "arg": "source_type", "flag": "--source-type" },
@@ -102,9 +112,10 @@ const DESCRIBE: &str = r#"{
     "properties": {
       "design": { "type": "string", "description": "design database (.odb) holding the power grid" },
       "net": { "type": "string", "description": "supply net to analyse, e.g. VDD" },
-      "inst_power": { "type": "string", "description": "file of per-instance power, one `INSTANCE WATTS` pair per line" },
+      "inst_power": { "type": "string", "description": "file of per-instance power, one `INSTANCE WATTS` pair per line, used instead of the timer's (diagnostic)" },
       "user_power": { "type": "string", "description": "one instance's power as INST=WATTS[@CORNER]" },
-      "liberty": { "type": "string", "description": "Liberty library (.lib, may be gzipped): the supply voltage and RC units" },
+      "liberty": { "type": "string", "description": "Liberty library (.lib, may be gzipped): the cells the instance power is computed from, the supply voltage and RC units" },
+      "sdc": { "type": "string", "description": "constraints (SDC) the instance power is timed under: clocks set the switching activity" },
       "net_voltage": { "type": "string", "description": "a supply net's voltage as NET=VOLTS[@CORNER], overriding the Liberty's" },
       "vsrc": { "type": "string", "description": "voltage-source location file (it also gives the source voltage); without it the sources are the net's block-terminal pins, else generated as source_type says" },
       "source_type": { "type": "string", "enum": ["FULL", "STRAPS", "BUMPS"], "description": "the generated source pattern when there is no vsrc and the net has no block-terminal pins (default BUMPS)" },
@@ -114,7 +125,7 @@ const DESCRIBE: &str = r#"{
   },
   "artifacts": [ { "role": "instance_voltages", "from_arg": "voltage_file" } ],
   "assertion": { "id": "ir-drop-reported", "not_applicable": true },
-  "consumes": ["odb", "liberty", "instance_power"]
+  "consumes": ["odb", "liberty", "sdc"]
 }"#;
 
 fn refuse(what: &str) -> ExitCode {
@@ -319,7 +330,9 @@ struct AnalyzeOpts {
     net_voltages: Vec<String>,
     inst_power: Option<String>,
     user_powers: Vec<String>,
-    liberties: Vec<String>,
+    corners: Vec<String>,
+    /// Each `read_liberty` in order: the corner it was read for (`None`: every corner), the file.
+    liberties: Vec<(Option<String>, String)>,
     sdcs: Vec<String>,
     layer_rcs: Vec<String>,
     corner: Option<String>,
@@ -348,7 +361,12 @@ fn analyze(args: &[String], spice: bool) -> ExitCode {
                 "--net-voltage" => o.net_voltages.push(value("NET=VOLTS@CORNER")?),
                 "--inst-power" => o.inst_power = Some(value("a file")?),
                 "--user-power" => o.user_powers.push(value("INST=WATTS@CORNER")?),
-                "--liberty" => o.liberties.push(value("a file")?),
+                "--liberty" => o.liberties.push((None, value("a file")?)),
+                "--liberty-corner" => {
+                    let corner = value("a corner and a file")?;
+                    o.liberties.push((Some(corner), value("a file")?));
+                }
+                "--corners" => o.corners = value("a list of corners")?.split([',', ' ']).filter(|x| !x.is_empty()).map(String::from).collect(),
                 "--sdc" => o.sdcs.push(value("a file")?),
                 "--layer-rc" => o.layer_rcs.push(value("set_layer_rc arguments")?),
                 "--corner" => o.corner = Some(value("a corner name")?),
@@ -415,7 +433,7 @@ fn analyze(args: &[String], spice: bool) -> ExitCode {
         },
         None => None,
     };
-    let c = Call { net: &net, net_id, tech: &tech, net_input: &net_input, inputs: &inputs, session: &session, o: &o, network: &network, dump_dir: dump_dir.as_deref() };
+    let c = Call { db: &db, net: &net, net_id, tech: &tech, net_input: &net_input, inputs: &inputs, session: &session, o: &o, network: &network, dump_dir: dump_dir.as_deref() };
     let previous = store.as_ref().and_then(|s| s.get(&net, &session.corner)).cloned();
     let solved = match previous.filter(|p| allow_reuse && p.has_solution) {
         Some(p) => {
@@ -508,6 +526,7 @@ fn activities(args: &[String]) -> ExitCode {
             }
             // Each term's float bits, as the reference's probe prints them.
             for (name, r) in &p {
+                let name = vyges_sta::power::path_name(name);
                 println!("VYG-POWER {name} internal {:08x} switching {:08x} leakage {:08x}", r.internal.to_bits(), r.switching.to_bits(), r.leakage.to_bits());
             }
             ExitCode::SUCCESS
@@ -557,7 +576,7 @@ fn write_spice(
             return ExitCode::from(1);
         }
     };
-    let c = Call { net, net_id: db.net_id(net).unwrap_or(0), tech, net_input, inputs, session, o, network: &network, dump_dir: None };
+    let c = Call { db, net, net_id: db.net_id(net).unwrap_or(0), tech, net_input, inputs, session, o, network: &network, dump_dir: None };
     let res = match resistances(&c) {
         Ok(r) => r,
         Err(code) => return code,
@@ -597,6 +616,7 @@ fn write_spice(
 
 /// What one `analyze` call reads.
 struct Call<'a> {
+    db: &'a vyges_opendb::Db,
     net: &'a str,
     net_id: u32,
     tech: &'a vyges_psm::input::Tech,
@@ -692,7 +712,11 @@ fn solve_net(c: &Call, store: &mut Option<vyges_psm::solution::Store>, save: Opt
     if power_voltage == 0.0 {
         return Err(fail(&["[ERROR PSM-0074] Unable to determine voltage for power nets.".to_string()]));
     }
-    let (currents, total_power) = solve::build_node_current_map(network, c.inputs, c.net_input, power_voltage, &s.timer_power, &s.user_power);
+    let timer_power = match &s.timer_power {
+        Some(given) => given.clone(),
+        None => timer_power(c)?,
+    };
+    let (currents, total_power) = solve::build_node_current_map(network, c.inputs, c.net_input, power_voltage, &timer_power, &s.user_power);
     let order = solve::assign_node_ids(network, &cond, &srcs, &real, &sources);
     let m = solve::build_cond_matrix_and_voltages(network, &srcs, &cond, &src_conds, &order, &currents, src_voltage, &sources);
     if let Some(dir) = c.dump_dir {
@@ -784,13 +808,44 @@ fn fail(lines: &[String]) -> ExitCode {
     ExitCode::from(1)
 }
 
+/// `getInstancePower` on the analysed corner: the timer built from the session's libraries and
+/// constraints. No library: no instance has a liberty cell, so no instance power. A timer this
+/// build cannot reproduce refuses (exit 3) rather than solving at 0 W.
+fn timer_power(c: &Call) -> Result<std::collections::HashMap<String, f32>, ExitCode> {
+    let o = c.o;
+    if o.liberties.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let mut liberties = Vec::new();
+    for (corner, f) in &o.liberties {
+        let text = read_maybe_gz(f).map_err(|e| usage_error(&format!("cannot read {f}: {e}")))?;
+        liberties.push((corner.clone(), text));
+    }
+    let mut sdcs = Vec::new();
+    for f in &o.sdcs {
+        sdcs.push(std::fs::read_to_string(f).map_err(|e| usage_error(&format!("cannot read {f}: {e}")))?);
+    }
+    // `-corner`: that scene; without corners defined, the one scene.
+    let scene = if o.corners.is_empty() {
+        0
+    } else {
+        o.corners.iter().position(|k| *k == c.session.corner).ok_or_else(|| usage_error(&format!("--corner {}: corner not defined", c.session.corner)))?
+    };
+    let inputs = vyges_psm::timer::TimerInputs { corners: &o.corners, liberties: &liberties, sdcs: &sdcs };
+    vyges_psm::timer::instance_powers(c.db, &inputs, scene).map_err(|e| {
+        eprintln!("vyges-psm: instance power: {e}");
+        refuse("this design's instance power")
+    })
+}
+
 /// The session state `analyze` runs in, resolved for its corner.
 struct Session {
     corner: String,
     settings: vyges_psm::solve::SourceSettings,
     source_type: vyges_psm::solve::SourceType,
     voltages: Vec<vyges_psm::solve::UserVoltage>,
-    timer_power: std::collections::HashMap<String, f32>,
+    /// `--inst-power`: each instance's power given, in place of the timer's (a diagnostic).
+    timer_power: Option<std::collections::HashMap<String, f32>>,
     user_power: std::collections::HashMap<String, f32>,
     pvt: Option<f32>,
     units: vyges_psm::solve::RcUnits,
@@ -829,8 +884,9 @@ fn analyze_session(db: &vyges_opendb::Db, o: &AnalyzeOpts) -> Result<Session, Ex
             user_power.insert(name, power);
         }
     }
-    let mut timer_power = std::collections::HashMap::new();
+    let mut timer_power = None;
     if let Some(f) = &o.inst_power {
+        let timer_power = timer_power.insert(std::collections::HashMap::new());
         let text = std::fs::read_to_string(f).map_err(|e| usage_error(&format!("cannot read {f}: {e}")))?;
         for line in text.lines() {
             let mut w = line.split_whitespace();
@@ -847,7 +903,7 @@ fn analyze_session(db: &vyges_opendb::Db, o: &AnalyzeOpts) -> Result<Session, Ex
             return Err(refuse("an SDC supply voltage"));
         }
     }
-    let (pvt, units) = match o.liberties.first() {
+    let (pvt, units) = match o.liberties.first().map(|(_, f)| f) {
         None => (None, solve::RcUnits::default()),
         Some(f) => {
             let text = read_maybe_gz(f).map_err(|e| usage_error(&format!("cannot read {f}: {e}")))?;

@@ -32,8 +32,15 @@ pub fn activities(db: &Db, inp: &TimerInputs<'_>) -> Result<Activities, String> 
     Ok(activities_and_powers(db, inp, None)?.0)
 }
 
+/// `IRSolver::getInstancePower`: each instance with a liberty cell, by its database name, and its
+/// `PowerResult::total()` on the scene (`internal + switching + leakage`, in float).
+pub fn instance_powers(db: &Db, inp: &TimerInputs<'_>, scene: usize) -> Result<HashMap<String, f32>, String> {
+    let (_, found) = activities_and_powers(db, inp, Some(scene))?;
+    Ok(found.into_iter().map(|(name, p)| (name, p.total())).collect())
+}
+
 /// `ensureActivities`, then, for the scene given (`analyze_power_grid -corner`), `findInstPowers`:
-/// each instance with a liberty cell, by name, in instance order.
+/// each instance with a liberty cell, by its database name, in instance order.
 pub fn activities_and_powers(db: &Db, inp: &TimerInputs<'_>, powers_scene: Option<usize>) -> Result<(Activities, Vec<(String, power::InstPower)>), String> {
     let mut liberty = vyges_est::liberty::LibertyClocks::default();
     let mut libs = Libs { scenes: inp.corners.to_vec(), scene_libs: vec![Vec::new(); inp.corners.len()], ..Libs::default() };
@@ -148,7 +155,7 @@ pub fn activities_and_powers(db: &Db, inp: &TimerInputs<'_>, powers_scene: Optio
     let ideal_clock_slew: Vec<Option<[f32; 2]>> = (0..n).map(|v| (gk.ideal_clock.contains(&v) || pin_drvr(v).is_some_and(|d| gk.ideal_clock.contains(&d))).then_some([0.0; 2])).collect();
     let pw = power::PowerInputs { constants: &gk.sdc.constants, ideal_clock_slew: &ideal_clock_slew, load_cap: &load_cap, link_libs: &libs.libs };
     let found = power::inst_powers(gk, &inputs, &act, &pw)?;
-    let named = found.into_iter().enumerate().filter_map(|(i, p)| p.map(|p| (power::path_name(&netlist.insts[i].0), p))).collect();
+    let named = found.into_iter().enumerate().filter_map(|(i, p)| p.map(|p| (netlist.insts[i].0.clone(), p))).collect();
     Ok((act, named))
 }
 
