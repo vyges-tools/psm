@@ -476,7 +476,7 @@ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "vyges-dpl"
-version = "0.1.48"
+version = "0.1.49"
 dependencies = [
  "serde",
  "serde_json",
@@ -486,22 +486,22 @@ dependencies = [
 
 [[package]]
 name = "vyges-drt"
-version = "0.1.48"
+version = "0.1.49"
 dependencies = [
  "rayon",
 ]
 
 [[package]]
 name = "vyges-est"
-version = "0.1.48"
+version = "0.1.49"
 dependencies = [
  "vyges-opendb",
 ]
 
 [[package]]
 name = "vyges-events"
-version = "0.1.48"
-source = "git+https://github.com/vyges-tools/events?branch=main#5994170c451376d339bf522becfdbca418f1bf80"
+version = "0.1.49"
+source = "git+https://github.com/vyges-tools/events?branch=main#2462235dac59beb5154fec4a6706588921b5cf00"
 dependencies = [
  "serde",
  "serde_json",
@@ -509,12 +509,12 @@ dependencies = [
 
 [[package]]
 name = "vyges-geom"
-version = "0.1.48"
-source = "git+https://github.com/vyges-tools/geom?branch=main#b1ed0f2ab0bc8fcf77768999a63e290fe7ea0198"
+version = "0.1.49"
+source = "git+https://github.com/vyges-tools/geom?branch=main#a7cbb9ddf7f2e4d3362e0a3c86dce6d87cb6597f"
 
 [[package]]
 name = "vyges-grt"
-version = "0.1.48"
+version = "0.1.49"
 dependencies = [
  "vyges-est",
  "vyges-opendb",
@@ -523,8 +523,8 @@ dependencies = [
 
 [[package]]
 name = "vyges-layout"
-version = "0.1.48"
-source = "git+https://github.com/vyges-tools/layout?branch=main#aefcac7759ce8ed72102c5936f082d949f19f5fa"
+version = "0.1.49"
+source = "git+https://github.com/vyges-tools/layout?branch=main#d8d547401b0b6f3ca29e0770ea600913bff949f2"
 dependencies = [
  "miniz_oxide 0.8.9",
  "vyges-geom",
@@ -532,11 +532,11 @@ dependencies = [
 
 [[package]]
 name = "vyges-loom"
-version = "0.1.48"
+version = "0.1.49"
 
 [[package]]
 name = "vyges-opendb"
-version = "0.1.48"
+version = "0.1.49"
 dependencies = [
  "cxx",
  "serde",
@@ -550,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "vyges-opendb-lib"
-version = "0.1.48"
+version = "0.1.49"
 dependencies = [
  "cmake",
  "cxx",
@@ -559,7 +559,7 @@ dependencies = [
 
 [[package]]
 name = "vyges-psm"
-version = "0.1.48"
+version = "0.1.49"
 dependencies = [
  "miniz_oxide 0.8.9",
  "serde_json",
@@ -576,7 +576,7 @@ dependencies = [
 
 [[package]]
 name = "vyges-rsz"
-version = "0.1.48"
+version = "0.1.49"
 dependencies = [
  "flate2",
  "serde_json",
@@ -592,15 +592,15 @@ dependencies = [
 
 [[package]]
 name = "vyges-sparselu"
-version = "0.1.48"
+version = "0.1.49"
 
 [[package]]
 name = "vyges-sta"
-version = "0.1.48"
+version = "0.1.49"
 
 [[package]]
 name = "vyges-stt"
-version = "0.1.48"
+version = "0.1.49"
 dependencies = [
  "serde_json",
  "vyges-events",

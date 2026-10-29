@@ -1,6 +1,6 @@
 [package]
 name = "vyges-psm"
-version = "0.1.48"
+version = "0.1.49"
 edition = "2021"
 description = "Power-grid analysis on the design database: connectivity check, static IR drop, per-node voltages, SPICE export."
 license = "Apache-2.0"
