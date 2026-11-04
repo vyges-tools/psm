@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The database read: the tech table and one net, decoded from the opendb shim's flat streams.
 
-use crate::input::{decode_net, decode_tech, NetInput, Tech};
+use crate::input::{decode_net, decode_net_45, decode_tech, NetInput, Tech};
 use crate::short::{decode_short_inputs, ShortInputs};
 
 pub fn tech(db: &vyges_opendb::Db) -> Result<Tech, String> {
@@ -12,7 +12,10 @@ pub fn tech(db: &vyges_opendb::Db) -> Result<Tech, String> {
 pub fn net(db: &vyges_opendb::Db, name: &str) -> Result<NetInput, String> {
     let raw = db.psm_net(name).map_err(|e| e.to_string())?;
     let names = db.psm_net_names(name).map_err(|e| e.to_string())?;
-    decode_net(name, &raw, &names)
+    let mut n = decode_net(name, &raw, &names)?;
+    let raw45 = db.psm_net_45(name).map_err(|e| e.to_string())?;
+    decode_net_45(&mut n, &raw45)?;
+    Ok(n)
 }
 
 /// Everything the short check walks besides the net itself.

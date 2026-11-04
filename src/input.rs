@@ -71,6 +71,9 @@ pub struct ViaShape {
 pub enum SBox {
     Wire { layer: i32, rect: Rect },
     Via { rect: Rect, xy: (i32, i32), top: i32, bottom: i32, shapes: Vec<ViaShape> },
+    /// An octilinear wire: `rect` is its bounding box, `points` its outline (`Oct::getPoints`,
+    /// closed). The network takes the outline, never the box.
+    Oct { layer: i32, rect: Rect, points: Vec<(i32, i32)> },
 }
 
 /// One geometry of a pin (an instance pin already moved by its instance's transform).
@@ -94,6 +97,27 @@ pub struct ITerm {
     pub bridge: bool,
     /// Every geometry of every pin of the terminal, in order.
     pub geoms: Vec<Geom>,
+    /// The terminal's pins in order, each holding a run of `geoms` and its polygons. Empty when
+    /// the database read carried none: then `geoms` is one pin with no polygons.
+    pub mpins: Vec<MPinShapes>,
+}
+
+/// One pin of an instance terminal: how many of the terminal's `geoms` are its boxes, and its
+/// polygons (`getPolygonGeometry`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MPinShapes {
+    pub boxes: usize,
+    pub polygons: Vec<PinPolygon>,
+}
+
+/// A pin polygon, moved by the instance transform, with the positions (in its pin's boxes) of
+/// the boxes odb decomposed it into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinPolygon {
+    /// Layer number.
+    pub layer: i32,
+    pub points: Vec<(i32, i32)>,
+    pub boxes: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,7 +276,7 @@ pub fn decode_net(name: &str, v: &[i64], names: &[String]) -> Result<NetInput, S
         let ngeoms = s.count()?;
         let geoms = (0..ngeoms).map(|_| s.geom()).collect::<Result<_, String>>()?;
         let name = names.next().cloned().unwrap_or_default();
-        iterms.push(ITerm { id, name, placed, fixed, bbox_inverted, avg, bridge, geoms });
+        iterms.push(ITerm { id, name, placed, fixed, bbox_inverted, avg, bridge, geoms, mpins: vec![] });
     }
     let nbterms = s.count()?;
     let mut bterms = Vec::with_capacity(nbterms);
@@ -280,6 +304,62 @@ pub fn decode_net(name: &str, v: &[i64], names: &[String]) -> Result<NetInput, S
     }
     s.done()?;
     Ok(NetInput { name: name.to_string(), supply, swires, iterms, bterms })
+}
+
+/// The 45-degree half of a net (`psm_net_45`), laid onto the net [`decode_net`] read: octilinear
+/// wires become [`SBox::Oct`], and each terminal gets its pins and their polygons.
+pub fn decode_net_45(net: &mut NetInput, v: &[i64]) -> Result<(), String> {
+    let mut s = Stream { v, at: 0 };
+    fn points(s: &mut Stream) -> Result<Vec<(i32, i32)>, String> {
+        let n = s.count()?;
+        (0..n).map(|_| Ok((s.int()?, s.int()?))).collect()
+    }
+    if s.count()? != net.swires.len() {
+        return Err("psm_net_45: swire count differs from psm_net".into());
+    }
+    for wire in &mut net.swires {
+        if s.count()? != wire.len() {
+            return Err("psm_net_45: swire box count differs from psm_net".into());
+        }
+        for b in wire.iter_mut() {
+            if !s.flag()? {
+                continue;
+            }
+            let pts = points(&mut s)?;
+            let SBox::Wire { layer, rect } = *b else {
+                return Err("psm_net_45: an octilinear box that is a via".into());
+            };
+            *b = SBox::Oct { layer, rect, points: pts };
+        }
+    }
+    if s.count()? != net.iterms.len() {
+        return Err("psm_net_45: iterm count differs from psm_net".into());
+    }
+    for it in &mut net.iterms {
+        let nmpins = s.count()?;
+        let mut mpins = Vec::with_capacity(nmpins);
+        for _ in 0..nmpins {
+            let boxes = s.count()?;
+            let npolys = s.count()?;
+            let mut polygons = Vec::with_capacity(npolys);
+            for _ in 0..npolys {
+                let layer = s.int()?;
+                let pts = points(&mut s)?;
+                let nat = s.count()?;
+                let at = (0..nat).map(|_| s.count()).collect::<Result<Vec<_>, String>>()?;
+                if at.iter().any(|&i| i >= boxes) {
+                    return Err("psm_net_45: a polygon box outside its pin".into());
+                }
+                polygons.push(PinPolygon { layer, points: pts, boxes: at });
+            }
+            mpins.push(MPinShapes { boxes, polygons });
+        }
+        if mpins.iter().map(|m| m.boxes).sum::<usize>() != it.geoms.len() {
+            return Err(format!("psm_net_45: the pins of {} hold another box count than psm_net", it.name));
+        }
+        it.mpins = mpins;
+    }
+    s.done()
 }
 
 #[cfg(test)]
