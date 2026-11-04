@@ -11,6 +11,7 @@ extern crate self as vyges_psm;
 pub mod check;
 pub mod input;
 pub mod network;
+pub mod polygon45;
 pub mod short;
 pub mod solution;
 pub mod solve;
