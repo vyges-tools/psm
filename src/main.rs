@@ -128,6 +128,18 @@ const DESCRIBE: &str = r#"{
   "consumes": ["odb", "liberty", "sdc"]
 }"#;
 
+/// A net the database cannot give. A database with no top block is a 3D-IC assembly (chiplets
+/// under a top chip, `read_3dbx`), whose grids the reference analyses chiplet by chiplet: that is
+/// refused with its reason, not failed (exit 3, no verdict). Anything else fails (exit 2).
+fn unread_net(net: &str, e: &str) -> ExitCode {
+    if e.contains("no top block") {
+        eprintln!("vyges-psm: net {net}: the database is a 3D-IC assembly (a top chip of chiplets, no top block)");
+        return refuse("power grid analysis of a 3D-IC assembly");
+    }
+    eprintln!("vyges-psm: cannot read net {net}: {e}");
+    ExitCode::from(2)
+}
+
 fn refuse(what: &str) -> ExitCode {
     vyges_events::emit(
         &vyges_events::Event::new("vyges-psm", vyges_events::Severity::Error, format!("{what} is not implemented in this build"))
@@ -213,10 +225,7 @@ fn check(args: &[String]) -> ExitCode {
     };
     let input = match vyges_psm::read::tech(&db).and_then(|t| vyges_psm::read::net(&db, &net).map(|n| (t, n))) {
         Ok(x) => x,
-        Err(e) => {
-            eprintln!("vyges-psm: cannot read net {net}: {e}");
-            return ExitCode::from(2);
-        }
+        Err(e) => return unread_net(&net, &e),
     };
     let (tech, net_input) = input;
     let opts = Connectivity { floorplanning, require_bterm, stats, dump_dir, error_file };
@@ -407,10 +416,7 @@ fn analyze(args: &[String], spice: bool) -> ExitCode {
     });
     let (tech, net_input, inputs) = match read {
         Ok(x) => x,
-        Err(e) => {
-            eprintln!("vyges-psm: cannot read net {net}: {e}");
-            return ExitCode::from(2);
-        }
+        Err(e) => return unread_net(&net, &e),
     };
     let session = match analyze_session(&db, &o) {
         Ok(s) => s,
