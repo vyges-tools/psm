@@ -1414,6 +1414,33 @@ mod tests {
         assert!(slanted.contains((13300, 12100)) && !slanted.contains((13100, 12100)));
     }
 
+    // Upstream 1d4cb901b1b (`Shape::getNodes`, `getSharedShapeNodes`): the box of a polygon piece
+    // can hold nodes that are not in it, here the centre of a rect in the corner of a diamond's
+    // left half. They belong to that piece only when `contains` (covered_by) says so: no layer
+    // connection joins the rect to the diamond, and the rect's node is on one shape, not shared.
+    #[test]
+    fn a_node_in_a_polygon_piece_box_but_outside_it_is_not_its_node() {
+        let t = tech();
+        let diamond = vec![(0, 1000), (1000, 2000), (2000, 1000), (1000, 0), (0, 1000)];
+        let n = net(vec![vec![
+            SBox::Oct { layer: 0, rect: r(0, 0, 2000, 2000), points: diamond },
+            wire(0, r(100, 1700, 300, 1900)),
+        ]]);
+        let (nw, _) = build(&t, &n);
+        assert!(nw.shapes.values().flatten().any(|s| s.polygon.is_some() && intersects(&s.rect, &r(200, 1800, 200, 1800))));
+        for &c in &nw.connections {
+            let conn = nw.conns[c];
+            if let (ConnKind::Layer { .. }, Some(a), Some(b)) = (conn.kind, conn.n0, conn.n1) {
+                let (pa, pb) = (nw.arena[a].pt, nw.arena[b].pt);
+                assert!(nw.shapes.values().flatten().any(|s| s.contains(pa) && s.contains(pb)), "{pa:?}-{pb:?} joins two shapes");
+            }
+        }
+        let on_m1: Vec<(i32, i32)> = nw.nodes.values().flatten().map(|&id| nw.arena[id].pt).collect();
+        assert!(on_m1.contains(&(200, 1800)), "the rect's centre is not merged into the diamond: {on_m1:?}");
+        let shared = nw.shared_shape_nodes();
+        assert!(shared.iter().all(|&id| nw.arena[id].pt != (200, 1800)), "the rect's centre is on one shape");
+    }
+
     // A horizontal layer is sliced VERTICALLY: an L of a long bar and a stub above it is the stub's
     // column plus the bar either side, three shapes, not the bar plus the stub.
     #[test]
