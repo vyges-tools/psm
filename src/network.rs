@@ -117,11 +117,15 @@ fn max_dxdy(r: &Rect) -> i32 {
     r.dx().max(r.dy())
 }
 
-/// An R-tree packed as the reference packs one: it is built against libstdc++, whose
-/// `nth_element` permutes the packing's slices and whose heap orders a nearest query's pending
-/// branches, so two nodes at the same distance are told apart exactly as there.
+/// The standard library the reference is built against: the Bazel build of the pin (4155ac3,
+/// clang with libc++) — the CMake build before it was GCC with libstdc++.
+pub const REF_STDLIB: StdLib = StdLib::LibCxx;
+
+/// An R-tree packed as the reference packs one: its standard library's `nth_element` permutes
+/// the packing's slices and its heap orders a nearest query's pending branches, so two nodes at
+/// the same distance are told apart exactly as there ([`REF_STDLIB`]).
 pub fn ref_tree<T>(values: Vec<(Rect, T)>) -> PackedRTree<T> {
-    PackedRTree::new_in(values, StdLib::LibStdCxx)
+    PackedRTree::new_in(values, REF_STDLIB)
 }
 
 fn point_rect(p: (i32, i32)) -> Rect {
@@ -981,6 +985,26 @@ impl<'a> Network<'a> {
 
 #[cfg(test)]
 mod tests {
+    // The reference's trees follow ITS standard library (the Bazel pin: libc++): among nodes
+    // tied for nearest, the one libc++'s packing and heap give — here libstdc++'s differs, so
+    // the choice is the library's, not the geometry's.
+    #[test]
+    fn a_nearest_tie_is_broken_as_the_reference_library_breaks_it() {
+        use vyges_drt::rtree::{PackedRTree, StdLib};
+        let ring = [(3, 4), (4, 3), (5, 0), (4, -3), (3, -4), (0, -5), (-3, -4), (-4, -3), (-5, 0), (-4, 3), (-3, 4), (0, 5)];
+        let mut pts: Vec<(i32, i32)> = Vec::new();
+        for k in 0..40 {
+            pts.push((100 + 7 * k, 50 - 3 * k));
+            pts.push((-90 - 5 * k, 30 + 11 * k));
+        }
+        pts.extend(ring);
+        let values = |pts: &[(i32, i32)]| pts.iter().enumerate().map(|(i, &p)| (point_rect(p), i)).collect::<Vec<_>>();
+        let pick = |t: &PackedRTree<usize>| t.nearest_one((0, 0), |_| true).map(|v| v.1);
+        let ours = pick(&ref_tree(values(&pts)));
+        assert_eq!(ours, pick(&PackedRTree::new_in(values(&pts), StdLib::LibCxx)));
+        assert_ne!(ours, pick(&PackedRTree::new_in(values(&pts), StdLib::LibStdCxx)));
+    }
+
     use super::*;
     use crate::input::{CutClass, Layer};
 
