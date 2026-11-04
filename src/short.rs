@@ -472,7 +472,9 @@ type LayerPieces = Vec<(i32, Vec<Piece>)>;
 
 struct Walk<'n, 'a> {
     nw: &'n Network<'a>,
-    trees: HashMap<usize, PackedRTree<Rect>>,
+    /// Per layer, the net's shapes: each one's box, and whether it is a polygon (a trapezoid with
+    /// 45 degree edges, which does not fill its box).
+    trees: HashMap<usize, PackedRTree<(Rect, bool)>>,
     shorts: Vec<Short>,
 }
 
@@ -491,35 +493,52 @@ impl Walk<'_, '_> {
     }
 
     /// The net's shapes a rectangle overlaps (touching is not a short): each overlap.
-    fn short_rect(&self, layer: Option<i32>, r: &Rect) -> (usize, Vec<(Rect, bool)>) {
-        let Some(li) = layer.and_then(|l| self.li(l)) else { return (0, vec![]) };
-        let Some(tree) = self.trees.get(&li) else { return (li, vec![]) };
-        (li, tree.query(r).into_iter().filter(|e| overlaps(&e.1, r)).map(|e| (intersect(&e.1, r), true)).collect())
+    ///
+    /// A polygon shape it overlaps is refused: its overlap is a polygon set operation this build
+    /// does not reproduce.
+    fn short_rect(&self, layer: Option<i32>, r: &Rect) -> Result<(usize, Vec<(Rect, bool)>), String> {
+        let Some(li) = layer.and_then(|l| self.li(l)) else { return Ok((0, vec![])) };
+        let Some(tree) = self.trees.get(&li) else { return Ok((li, vec![])) };
+        let mut out = Vec::new();
+        for e in tree.query(r) {
+            let (shape, polygon) = e.1;
+            if !overlaps(&shape, r) {
+                continue;
+            }
+            if polygon {
+                return Err(POLYGON_SHORT.to_string());
+            }
+            out.push((intersect(&shape, r), true));
+        }
+        Ok((li, out))
     }
 
     /// The net's shapes a region overlaps: per shape, every piece of the overlap. With
     /// `require_overlap` an overlap that does not reach into the shape is not one.
-    fn short_region(&self, li: usize, rs: &[Rect], require_overlap: bool) -> Vec<(Rect, bool)> {
-        let Some(tree) = self.trees.get(&li) else { return vec![] };
+    fn short_region(&self, li: usize, rs: &[Rect], require_overlap: bool) -> Result<Vec<(Rect, bool)>, String> {
+        let Some(tree) = self.trees.get(&li) else { return Ok(vec![]) };
         let mut out = Vec::new();
         for e in tree.query(&bbox(rs)) {
-            let shape = e.1;
+            let (shape, polygon) = e.1;
             let overlap = clip(rs, &shape);
             if overlap.is_empty() {
                 continue;
+            }
+            if polygon {
+                return Err(POLYGON_SHORT.to_string());
             }
             if require_overlap && !overlaps(&shape, &bbox(&overlap)) {
                 continue;
             }
             out.extend(pieces(&overlap).iter().map(|p| (bbox(p), p.len() == 1)));
         }
-        out
+        Ok(out)
     }
 
     /// [`Self::short_region`] for either kind of piece.
     fn short_piece(&self, li: usize, p: &Piece, require_overlap: bool) -> Result<Vec<(Rect, bool)>, String> {
         let pts = match p {
-            Piece::Rects(rs) => return Ok(self.short_region(li, rs, require_overlap)),
+            Piece::Rects(rs) => return self.short_region(li, rs, require_overlap),
             Piece::Convex(pts) => pts,
         };
         let Some(tree) = self.trees.get(&li) else { return Ok(vec![]) };
@@ -531,8 +550,12 @@ impl Walk<'_, '_> {
         };
         let mut out = Vec::new();
         for e in tree.query(&bb) {
-            let Some(o) = clip_convex(pts, &e.1)? else { continue };
-            if require_overlap && !overlaps(&e.1, &o.0) {
+            let (shape, polygon) = e.1;
+            let Some(o) = clip_convex(pts, &shape)? else { continue };
+            if polygon {
+                return Err(POLYGON_SHORT.to_string());
+            }
+            if require_overlap && !overlaps(&shape, &o.0) {
                 continue;
             }
             out.push(o);
@@ -541,17 +564,17 @@ impl Walk<'_, '_> {
     }
 
     /// A box: a via's shapes layer by layer, or the box on its own layer.
-    fn short_box(&mut self, g: &BoxGeom, to: &Other) -> bool {
+    fn short_box(&mut self, g: &BoxGeom, to: &Other) -> Result<bool, String> {
         let parts: Vec<(Option<i32>, Rect)> = if g.is_via { g.via.iter().filter(|v| v.0.is_some()).copied().collect() } else { vec![(g.layer, g.rect)] };
         for (layer, r) in parts {
-            let (li, found) = self.short_rect(layer, &r);
+            let (li, found) = self.short_rect(layer, &r)?;
             for o in found {
                 if !self.add(li, o, to) {
-                    return false;
+                    return Ok(false);
                 }
             }
         }
-        true
+        Ok(true)
     }
 }
 
@@ -641,11 +664,14 @@ fn master_obstructions(nw: &Network, m: &MasterGeom) -> Result<LayerPieces, Stri
     Ok(out)
 }
 
+/// The refusal for a short against a shape with 45 degree edges.
+const POLYGON_SHORT: &str = "a short against a shape with 45 degree edges";
+
 /// The check's walk. `Ok((shorts, stopped))`; `Err` for an object the walk cannot measure yet.
 pub fn check_short(nw: &Network, si: &ShortInputs, check_placed: bool) -> Result<(Vec<Short>, bool), String> {
     let mut trees = HashMap::new();
     for (k, shapes) in &nw.shapes {
-        trees.insert(k.li, ref_tree(shapes.iter().map(|s| (s.rect, s.rect)).collect()));
+        trees.insert(k.li, ref_tree(shapes.iter().map(|s| (s.rect, (s.rect, s.polygon.is_some()))).collect()));
     }
     let mut w = Walk { nw, trees, shorts: Vec::new() };
     let counts = |placed: bool, fixed: bool| if check_placed { placed } else { fixed };
@@ -654,7 +680,7 @@ pub fn check_short(nw: &Network, si: &ShortInputs, check_placed: bool) -> Result
             let to = Other { to: format!("terminal {bterm} (net {})", net.name), sources: vec![Source::BTerm(bterm.clone()), Source::Net(net.name.clone())] };
             for pin in pins.iter().filter(|p| counts(p.placed, p.fixed)) {
                 for g in &pin.boxes {
-                    if !w.short_box(g, &to) {
+                    if !w.short_box(g, &to)? {
                         return Ok((w.shorts, true));
                     }
                 }
@@ -665,12 +691,12 @@ pub fn check_short(nw: &Network, si: &ShortInputs, check_placed: bool) -> Result
             if *octilinear {
                 return Err(format!("an octilinear special wire on net {}", net.name));
             }
-            if !w.short_box(g, &to) {
+            if !w.short_box(g, &to)? {
                 return Ok((w.shorts, true));
             }
         }
         for g in &net.wire {
-            if !w.short_box(g, &to) {
+            if !w.short_box(g, &to)? {
                 return Ok((w.shorts, true));
             }
         }
@@ -725,7 +751,7 @@ pub fn check_short(nw: &Network, si: &ShortInputs, check_placed: bool) -> Result
             None => "obstruction".to_string(),
         };
         let to = Other { to, sources };
-        let (li, found) = w.short_rect(obs.layer, &obs.rect);
+        let (li, found) = w.short_rect(obs.layer, &obs.rect)?;
         for o in found {
             if !w.add(li, o, &to) {
                 return Ok((w.shorts, true));
@@ -736,7 +762,7 @@ pub fn check_short(nw: &Network, si: &ShortInputs, check_placed: bool) -> Result
         let to = if f.mask == 0 { "fill".to_string() } else { format!("fill with mask {}", f.mask) };
         // The marker cannot name a fill.
         let to = Other { to, sources: vec![] };
-        let (li, found) = w.short_rect(f.layer, &f.rect);
+        let (li, found) = w.short_rect(f.layer, &f.rect)?;
         for o in found {
             if !w.add(li, o, &to) {
                 return Ok((w.shorts, true));
