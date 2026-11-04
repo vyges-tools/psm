@@ -732,7 +732,9 @@ fn solve_net(c: &Call, store: &mut Option<vyges_psm::solution::Store>, save: Opt
         write_dump(dir, "G_bits", &solve::matrix_bits_lines(&m));
         write_dump(dir, "J_bits", &solve::vector_bits_lines(&m.j));
     }
-    let Ok(lu) = vyges_sparselu::SparseLu::compute(&solve::csc_of(&m), vyges_sparselu::REFERENCE_CACHES) else {
+    // The reference pin 4155ac3 is a Bazel build, which pins Eigen tag 3.4.0 (`eigen 3.4.0.bcr.3`):
+    // its supernodal updates sum in `sparselu_gemm`'s order, not the 3.4 branch's generic product.
+    let Ok(lu) = vyges_sparselu::SparseLu::compute_with(&solve::csc_of(&m), vyges_sparselu::REFERENCE_CACHES, vyges_sparselu::Eigen::Tag340) else {
         return Err(refuse("a structurally singular conductance matrix"));
     };
     let (_, _, v) = lu.solve_stages(&m.j);
