@@ -34,8 +34,15 @@ pub fn activities(db: &Db, inp: &TimerInputs<'_>) -> Result<Activities, String> 
 
 /// `IRSolver::getInstancePower`: each instance with a liberty cell, by its database name, and its
 /// `PowerResult::total()` on the scene (`internal + switching + leakage`, in float).
+///
+/// The register passes that did not settle are warned of once per process, as the reference's
+/// power analysis warns once per session (`STA-2402`).
 pub fn instance_powers(db: &Db, inp: &TimerInputs<'_>, scene: usize) -> Result<HashMap<String, f32>, String> {
-    let (_, found) = activities_and_powers(db, inp, Some(scene))?;
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let (act, found) = activities_and_powers(db, inp, Some(scene))?;
+    if act.not_converged && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        println!("{}", power::NOT_CONVERGED);
+    }
     Ok(found.into_iter().map(|(name, p)| (name, p.total())).collect())
 }
 
@@ -131,9 +138,11 @@ pub fn activities_and_powers(db: &Db, inp: &TimerInputs<'_>, powers_scene: Optio
     let clock: Vec<Option<power::Activity>> = (0..n)
         .map(|v| if is_clock[v] { search.find_clk(v).map(|c| power::clock_activity(c.period, c.waveform[0], c.waveform[1])) } else { None })
         .collect();
+    let constant: Vec<Option<bool>> = g.vertices.iter().map(|x| g.sdc.constants.get(&x.name).copied()).collect();
+    let clk_period: Vec<Option<f32>> = (0..n).map(|v| search.find_clk(v).map(|c| c.period)).collect();
     let min_rf_slew: Vec<f32> = (0..n).map(|v| graphs.iter().map(|gk| min_rf_slew(&gk.slew[v])).fold(f32::INFINITY, f32::min)).collect();
     let min_period = if ssdc.clocks.is_empty() { 0.0 } else { ssdc.clocks.iter().map(|c| c.period).fold(f32::INFINITY, f32::min) };
-    let inputs = ActivityInputs { level: &level, clock_source: &clock_source, is_clock: &is_clock, clock: &clock, min_rf_slew: &min_rf_slew, min_period, time_unit: time_scale };
+    let inputs = ActivityInputs { level: &level, clock_source: &clock_source, is_clock: &is_clock, clock: &clock, min_rf_slew: &min_rf_slew, clk_period: &clk_period, constant: &constant, min_period, time_unit: time_scale };
     let act = power::ensure_activities(g, &inputs)?;
     let Some(k) = powers_scene else { return Ok((act, Vec::new())) };
     if sdc_text.lines().any(|l| l.split_whitespace().next() == Some("set_clock_transition")) {
