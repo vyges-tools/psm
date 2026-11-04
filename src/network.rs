@@ -15,9 +15,11 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use vyges_drt::polygon90::Polygon90Set;
+
+use crate::polygon45::{Polygon45Set, PolygonWithHoles, Pt};
 use vyges_drt::rtree::{PackedRTree, StdLib};
 
-use crate::input::{Dir, Geom, NetInput, Rect, SBox, Tech, ViaShape};
+use crate::input::{Dir, Geom, ITerm, NetInput, Rect, SBox, Tech, ViaShape};
 
 /// The coarsest node pitch, in microns, and the pitch multiple that caps it per layer.
 const MIN_NODE_PITCH_UM: f64 = 10.0;
@@ -70,11 +72,227 @@ pub struct Conn {
     pub kind: ConnKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A piece of a layer's metal: a `RectShape` (`polygon` none), or a `PolygonShape`, a trapezoid
+/// with 45 degree edges whose `rect` is only its bounding box.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shape {
     pub rect: Rect,
     pub li: usize,
     pub id: usize,
+    /// The trapezoid's points, corrected (clockwise, closed) as `odb::Polygon` holds them.
+    pub polygon: Option<Vec<Pt>>,
+}
+
+/// Why a build stopped: an error the reference reports too, or a case this build refuses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildError {
+    Error(String),
+    Refused(String),
+}
+
+/// The length and width of the metal joining two nodes of a shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionSize {
+    pub length: i32,
+    pub width: i32,
+}
+
+impl Shape {
+    /// True when the point is in the shape or on its boundary (`boost::geometry::covered_by`
+    /// for a polygon).
+    pub fn contains(&self, p: (i32, i32)) -> bool {
+        match &self.polygon {
+            None => rect_holds(&self.rect, p),
+            Some(pts) => covered_by(p, pts),
+        }
+    }
+
+    /// `getConnectionSize`: a rect measures along the longer axis and across the shape; a
+    /// polygon along the line between the points and across the shape square to it, through
+    /// their middle.
+    pub fn connection_size(&self, p0: (i32, i32), p1: (i32, i32)) -> ConnectionSize {
+        let Some(pts) = &self.polygon else {
+            let (len_x, len_y) = ((p1.0 - p0.0).abs(), (p1.1 - p0.1).abs());
+            if len_x > len_y {
+                return ConnectionSize { length: len_x, width: self.rect.dy() };
+            }
+            return ConnectionSize { length: len_y, width: self.rect.dx() };
+        };
+        let dx = f64::from(p1.0 - p0.0);
+        let dy = f64::from(p1.1 - p0.1);
+        let length = dx.hypot(dy);
+        if length == 0.0 {
+            return ConnectionSize { length: 0, width: self.rect.dx() };
+        }
+        let mx = f64::from(p0.0 + p1.0) / 2.0;
+        let my = f64::from(p0.1 + p1.1) / 2.0;
+        let (t_min, t_max) = clip_line(pts, mx, my, -dy / length, dx / length);
+        ConnectionSize { length: lround(length), width: 1.max(lround(t_max - t_min)) }
+    }
+
+    /// `getFillerPoint`: where the filler node for `p` goes. A rect takes `p`; a polygon the
+    /// middle of the line across it through `p` (square to the step), none when it misses.
+    pub fn filler_point(&self, p: (i32, i32), along_x: bool) -> Option<(i32, i32)> {
+        let Some(pts) = &self.polygon else { return Some(p) };
+        let (dx, dy) = if along_x { (0.0, 1.0) } else { (1.0, 0.0) };
+        let (t_min, t_max) = clip_line(pts, f64::from(p.0), f64::from(p.1), dx, dy);
+        if t_min > t_max {
+            return None;
+        }
+        let middle = lround((t_min + t_max) / 2.0);
+        Some(if along_x { (p.0, p.1 + middle) } else { (p.0 + middle, p.1) })
+    }
+}
+
+/// `std::lround` to an int, as the reference casts it.
+fn lround(v: f64) -> i32 {
+    v.round() as i32
+}
+
+/// `clipLine`: the range of t over which `p + t * dir` lies in the convex polygon (clockwise,
+/// closed: the inside of an edge is to its right), empty (first above second) when it misses.
+fn clip_line(pts: &[Pt], px: f64, py: f64, dir_x: f64, dir_y: f64) -> (f64, f64) {
+    let mut t_min = f64::NEG_INFINITY;
+    let mut t_max = f64::INFINITY;
+    for i in 0..pts.len().saturating_sub(1) {
+        let edge_x = f64::from(pts[i + 1].0 - pts[i].0);
+        let edge_y = f64::from(pts[i + 1].1 - pts[i].1);
+        let offset = edge_y * (px - f64::from(pts[i].0)) - edge_x * (py - f64::from(pts[i].1));
+        let rate = edge_y * dir_x - edge_x * dir_y;
+        if rate == 0.0 {
+            if offset < 0.0 {
+                return (1.0, 0.0);
+            }
+            continue;
+        }
+        let t = -offset / rate;
+        if rate > 0.0 {
+            t_min = t_min.max(t);
+        } else {
+            t_max = t_max.min(t);
+        }
+    }
+    (t_min, t_max)
+}
+
+/// The closed rectangle holds the point (`Rect::intersects(Point)`).
+fn rect_holds(r: &Rect, p: (i32, i32)) -> bool {
+    p.0 >= r.xl && p.0 <= r.xh && p.1 >= r.yl && p.1 <= r.yh
+}
+
+/// `boost::geometry::covered_by(point, ring)` on integer points: on the boundary, or inside by
+/// the crossing count. Exact; the ring's orientation does not change the answer.
+fn covered_by(p: (i32, i32), pts: &[Pt]) -> bool {
+    let (px, py) = (i64::from(p.0), i64::from(p.1));
+    let mut inside = false;
+    for w in pts.windows(2) {
+        let (ax, ay) = (i64::from(w[0].0), i64::from(w[0].1));
+        let (bx, by) = (i64::from(w[1].0), i64::from(w[1].1));
+        let cross = (bx - ax) * (py - ay) - (by - ay) * (px - ax);
+        if cross == 0 && px >= ax.min(bx) && px <= ax.max(bx) && py >= ay.min(by) && py <= ay.max(by) {
+            return true;
+        }
+        if (ay > py) != (by > py) {
+            // the edge crosses the horizontal through p: on which side of p
+            let lhs = (px - ax) * (by - ay);
+            let rhs = (bx - ax) * (py - ay);
+            if (by > ay && lhs < rhs) || (by < ay && lhs > rhs) {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+/// `boost::geometry::correct` on odb's ring (clockwise, closed), as `odb::Polygon` stores its
+/// points: closed on its first point, then reversed when it runs counterclockwise.
+fn correct_ring(mut pts: Vec<Pt>) -> Vec<Pt> {
+    if pts.len() <= 2 {
+        return pts;
+    }
+    if pts.first() != pts.last() {
+        let first = pts[0];
+        pts.push(first);
+    }
+    let mut twice_ccw: i128 = 0;
+    for w in pts.windows(2) {
+        twice_ccw += i128::from(w[0].0) * i128::from(w[1].1) - i128::from(w[1].0) * i128::from(w[0].1);
+    }
+    if twice_ccw > 0 {
+        pts.reverse();
+    }
+    pts
+}
+
+/// `odb::Polygon::getEnclosingRect`.
+fn enclosing_rect(pts: &[Pt]) -> Rect {
+    let mut r = Rect { xl: i32::MAX, yl: i32::MAX, xh: i32::MIN, yh: i32::MIN };
+    for p in pts {
+        r.xl = r.xl.min(p.0);
+        r.yl = r.yl.min(p.1);
+        r.xh = r.xh.max(p.0);
+        r.yh = r.yh.max(p.1);
+    }
+    r
+}
+
+/// `odb::Polygon::isRect`: at least four points, and every edge (the closing one included) on a
+/// side of the enclosing rect.
+fn is_rect(pts: &[Pt]) -> bool {
+    if pts.len() < 4 {
+        return false;
+    }
+    let r = enclosing_rect(pts);
+    for i in 0..pts.len() {
+        let (p0, p1) = (pts[i], pts[(i + 1) % pts.len()]);
+        let horizontal = p0.1 == p1.1 && (p0.1 == r.yl || p0.1 == r.yh);
+        let vertical = p0.0 == p1.0 && (p0.0 == r.xl || p0.0 == r.xh);
+        if !horizontal && !vertical {
+            return false;
+        }
+    }
+    true
+}
+
+/// `getSharedEdgeCenters`: the middle of every vertical edge overlap of two closed point lists,
+/// in the first list's then the second's edge order.
+fn shared_edge_centers(p0: &[Pt], p1: &[Pt]) -> Vec<Pt> {
+    let mut out = Vec::new();
+    for i in 0..p0.len().saturating_sub(1) {
+        let (s0, e0) = (p0[i], p0[i + 1]);
+        for j in 0..p1.len().saturating_sub(1) {
+            let (s1, e1) = (p1[j], p1[j + 1]);
+            if s0.0 != e0.0 || s1.0 != e1.0 || s0.0 != s1.0 {
+                continue;
+            }
+            let low = s0.1.min(e0.1).max(s1.1.min(e1.1));
+            let high = s0.1.max(e0.1).min(s1.1.max(e1.1));
+            if low < high {
+                out.push((s0.0, (low + high) / 2));
+            }
+        }
+    }
+    out
+}
+
+/// A layer's rectilinear shapes as the reference's `BoostPolygon90Set` holds them: the set, and
+/// every rectangle put in it, in order (what a 45-degree set reads when it takes the layer).
+#[derive(Debug, Clone, Default)]
+struct Shapes90 {
+    set: Polygon90Set,
+    rects: Vec<Rect>,
+}
+
+impl Shapes90 {
+    fn insert_rect(&mut self, r: Rect) {
+        self.set.insert_rect(r);
+        self.rects.push(r);
+    }
+}
+
+/// A trapezoid of a 45-degree set: `Err` (a refusal) for boost's precision error.
+fn refused(e: String) -> BuildError {
+    BuildError::Refused(format!("a 45-degree layer boost refuses ({e})"))
 }
 
 /// What the build reports besides the network.
@@ -154,9 +372,9 @@ fn layer_rectangles(set: &mut Polygon90Set, dir: Dir) -> Vec<Rect> {
 
 impl<'a> Network<'a> {
     /// The construction: `None` when the net has no nodes at all (the caller reports it empty).
-    pub fn build(tech: &'a Tech, net: &NetInput, floorplanning: bool, dump: Option<DumpFn<'a>>) -> Result<(Network<'a>, BuildLog), String> {
+    pub fn build(tech: &'a Tech, net: &NetInput, floorplanning: bool, dump: Option<DumpFn<'a>>) -> Result<(Network<'a>, BuildLog), BuildError> {
         if !net.supply {
-            return Err(format!("{} is not a supply net.", net.name));
+            return Err(BuildError::Error(format!("{} is not a supply net.", net.name)));
         }
         let mut n = Network {
             tech,
@@ -172,15 +390,15 @@ impl<'a> Network<'a> {
             dump,
         };
         n.init_minimum_node_pitch();
-        let log = n.construct(net);
+        let log = n.construct(net)?;
         Ok((n, log))
     }
 
-    fn construct(&mut self, net: &NetInput) -> BuildLog {
-        self.generate_routing_layer_shapes_and_nodes(net);
+    fn construct(&mut self, net: &NetInput) -> Result<BuildLog, BuildError> {
+        self.generate_routing_layer_shapes_and_nodes(net)?;
         self.generate_cut_layer_nodes(net);
         if !self.has_nodes() {
-            return BuildLog { empty: true };
+            return Ok(BuildLog { empty: true });
         }
         self.generate_top_layer_filler_nodes();
         self.sort_nodes();
@@ -194,7 +412,7 @@ impl<'a> Network<'a> {
         self.cleanup_connections();
         self.sort_connections();
         self.dump_nodes("after_connection_cleanup");
-        BuildLog::default()
+        Ok(BuildLog::default())
     }
 
     // ---- small helpers ------------------------------------------------------------------------
@@ -330,23 +548,53 @@ impl<'a> Network<'a> {
         out
     }
 
-    fn polygons_from_swire(&self, wire: &[SBox], into: &mut BTreeMap<LayerKey, Polygon90Set>) {
+    /// A special wire's metal: an octilinear box goes in whole to its layer's 45-degree set (its
+    /// box would be all of its bounding box), every other box to the layer's rectilinear set.
+    fn polygons_from_swire(&self, wire: &[SBox], into: &mut BTreeMap<LayerKey, Shapes90>, into_45: &mut BTreeMap<LayerKey, Polygon45Set>) {
         for b in wire {
             let g = match b {
+                SBox::Oct { layer, points, .. } => {
+                    let li = self.li(*layer);
+                    if self.tech.layers[li].routing_level != 0 {
+                        into_45.entry(self.key(li)).or_default().insert_polygon(points);
+                    }
+                    continue;
+                }
                 SBox::Wire { layer, rect } => Geom { is_via: false, layer: Some(*layer), rect: *rect, via_shapes: vec![] },
                 SBox::Via { rect, shapes, .. } => Geom { is_via: true, layer: None, rect: *rect, via_shapes: shapes.clone() },
             };
             for (k, rs) in self.polygons_from_box(&g) {
                 let set = into.entry(k).or_default();
-                rs.into_iter().for_each(|r| set.insert_rect(r));
+                for r in rs {
+                    set.insert_rect(r);
+                }
             }
         }
+    }
+
+    /// A terminal's pins in order: (its boxes, its polygons). Without pins read, all its boxes
+    /// are one pin.
+    fn mpin_runs(it: &ITerm) -> Vec<(&[Geom], &[crate::input::PinPolygon])> {
+        if it.mpins.is_empty() {
+            return vec![(&it.geoms[..], &[])];
+        }
+        let mut out = Vec::new();
+        let mut at = 0;
+        for m in &it.mpins {
+            out.push((&it.geoms[at..at + m.boxes], &m.polygons[..]));
+            at += m.boxes;
+        }
+        out
     }
 
     /// Instance terminals: a base node per terminal at its pins' average point, on the side its
     /// pins are on, and a terminal node per pin shape linked to it. Floorplanning skips any
     /// instance not FIXED; if none was skipped, floorplanning is turned off.
-    fn polygons_from_iterms(&mut self, net: &NetInput, into: &mut BTreeMap<LayerKey, Polygon90Set>) {
+    ///
+    /// Per pin, a polygon with 45 degree edges goes to its layer's 45-degree set itself (odb's
+    /// boxes for it reach outside of it, so they are skipped), with a terminal node at the
+    /// centre of each of its trapezoids; then the pin's other boxes as before.
+    fn polygons_from_iterms(&mut self, net: &NetInput, into: &mut BTreeMap<LayerKey, Shapes90>, into_45: &mut BTreeMap<LayerKey, Polygon45Set>) -> Result<(), BuildError> {
         let front = self.tech.front_base.map(|n| self.li(n));
         let back = self.tech.back_base.map(|n| self.li(n));
         let mut floorplan_asserted = false;
@@ -379,14 +627,39 @@ impl<'a> Network<'a> {
             let base_li = base_layer.expect("a front-side routing layer");
             let base = self.new_node(it.avg, base_li, NodeKind::ITerm { iterm: ti, id: it.id }, Some(point_rect(it.avg)));
             let mut has_routing_term = false;
-            for g in &it.geoms {
+            for (boxes, polygons) in Self::mpin_runs(it) {
+            let mut polygon_boxes: BTreeSet<usize> = BTreeSet::new();
+            for poly in polygons {
+                let li = self.li(poly.layer);
+                let rectilinear = !poly.points.windows(2).any(|w| w[0].0 != w[1].0 && w[0].1 != w[1].1);
+                if self.tech.layers[li].routing_level == 0 || rectilinear {
+                    continue;
+                }
+                polygon_boxes.extend(poly.boxes.iter().copied());
+                let mut pin_set = Polygon45Set::new();
+                pin_set.insert_polygon(&poly.points);
+                into_45.entry(self.key(li)).or_default().insert_set(&pin_set);
+                // a trapezoid of a vertical slicing holds the centre of its box
+                for piece in pin_set.trapezoids().map_err(refused)? {
+                    has_routing_term = true;
+                    let t = self.terminal(enclosing_rect(&piece), li);
+                    self.link_terminal(base, t, primary_is_back, it.bridge);
+                    self.push_node(t);
+                }
+            }
+            for (gi, g) in boxes.iter().enumerate() {
+                if polygon_boxes.contains(&gi) {
+                    continue;
+                }
                 let pin_shapes = self.polygons_from_box(g);
                 if pin_shapes.is_empty() {
                     continue;
                 }
                 for (k, rs) in &pin_shapes {
                     let set = into.entry(*k).or_default();
-                    rs.iter().for_each(|r| set.insert_rect(*r));
+                    for r in rs {
+                        set.insert_rect(*r);
+                    }
                 }
                 if g.is_via {
                     for (k, rs) in pin_shapes {
@@ -407,6 +680,7 @@ impl<'a> Network<'a> {
                     self.push_node(t);
                 }
             }
+            }
             if has_routing_term {
                 self.iterm_nodes.push(base);
             }
@@ -414,6 +688,7 @@ impl<'a> Network<'a> {
         if self.floorplanning && !floorplan_asserted {
             self.floorplanning = false;
         }
+        Ok(())
     }
 
     /// A terminal on the base node's side joins it; one across the boundary joins only through a
@@ -431,13 +706,15 @@ impl<'a> Network<'a> {
     }
 
     /// Block pins: every non-via box gets a terminal node and a pin node, joined.
-    fn polygons_from_bterms(&mut self, net: &NetInput, into: &mut BTreeMap<LayerKey, Polygon90Set>) {
+    fn polygons_from_bterms(&mut self, net: &NetInput, into: &mut BTreeMap<LayerKey, Shapes90>) {
         for bt in &net.bterms {
             for pin in &bt.pins {
                 for b in &pin.boxes {
                     for (k, rs) in self.polygons_from_box(&b.geom) {
                         let set = into.entry(k).or_default();
-                        rs.into_iter().for_each(|r| set.insert_rect(r));
+                        for r in rs {
+                            set.insert_rect(r);
+                        }
                     }
                     if b.geom.is_via {
                         continue;
@@ -473,26 +750,81 @@ impl<'a> Network<'a> {
                 new_nodes.push(self.new_node(pt, li, NodeKind::Node, None));
             }
             // (The reference also collects the terminals each rectangle overlaps; nothing reads them.)
-            new_shapes.push(Shape { rect: *rect, li, id: 0 });
+            new_shapes.push(Shape { rect: *rect, li, id: 0, polygon: None });
         }
     }
 
-    fn generate_routing_layer_shapes_and_nodes(&mut self, net: &NetInput) {
-        let mut shapes_by_layer: BTreeMap<LayerKey, Polygon90Set> = BTreeMap::new();
-        for wire in &net.swires {
-            self.polygons_from_swire(wire, &mut shapes_by_layer);
+    /// One merged polygon of a 45-degree layer, sliced into trapezoids: a piece that is a
+    /// rectangle is a rect shape, the others keep their polygon. Each piece gets a node at the
+    /// centre of its box and one at the middle of each vertical edge it shares with a LATER
+    /// piece whose box it touches.
+    fn process_polygon_to_trapezoids(&mut self, li: usize, polygon: &PolygonWithHoles, new_shapes: &mut Vec<Shape>, new_nodes: &mut Vec<NodeId>) -> Result<(), BuildError> {
+        let mut set = Polygon45Set::new();
+        set.insert_polygon_with_holes(polygon);
+        let mut shapes = Vec::new();
+        let mut shape_points = Vec::new();
+        for trapezoid in set.trapezoids().map_err(refused)? {
+            let mut pts = trapezoid;
+            if !pts.is_empty() && pts.first() != pts.last() {
+                let first = pts[0];
+                pts.push(first);
+            }
+            let piece = correct_ring(pts);
+            let rect = enclosing_rect(&piece);
+            let poly = if is_rect(&piece) { None } else { Some(piece.clone()) };
+            shapes.push(Shape { rect, li, id: 0, polygon: poly });
+            shape_points.push(piece);
         }
-        self.polygons_from_iterms(net, &mut shapes_by_layer);
+        for i in 0..shapes.len() {
+            let mut pts: BTreeSet<(i32, i32)> = BTreeSet::new();
+            pts.insert(center(&shapes[i].rect));
+            for j in i + 1..shapes.len() {
+                if !intersects(&shapes[i].rect, &shapes[j].rect) {
+                    continue;
+                }
+                pts.extend(shared_edge_centers(&shape_points[i], &shape_points[j]));
+            }
+            for pt in pts {
+                new_nodes.push(self.new_node(pt, li, NodeKind::Node, None));
+            }
+            // (The reference also collects the terminals each piece holds; nothing reads them.)
+        }
+        new_shapes.extend(shapes);
+        Ok(())
+    }
+
+    fn generate_routing_layer_shapes_and_nodes(&mut self, net: &NetInput) -> Result<(), BuildError> {
+        let mut shapes_by_layer: BTreeMap<LayerKey, Shapes90> = BTreeMap::new();
+        let mut shapes_45_by_layer: BTreeMap<LayerKey, Polygon45Set> = BTreeMap::new();
+        for wire in &net.swires {
+            self.polygons_from_swire(wire, &mut shapes_by_layer, &mut shapes_45_by_layer);
+        }
+        self.polygons_from_iterms(net, &mut shapes_by_layer, &mut shapes_45_by_layer)?;
         self.polygons_from_bterms(net, &mut shapes_by_layer);
+        // A layer with shapes with 45 degree edges is merged with them and sliced into
+        // trapezoids rather than rectangles.
+        let mut all_poly_45_shapes = Vec::new();
+        for (k, mut shapes_45) in shapes_45_by_layer {
+            if let Some(s90) = shapes_by_layer.remove(&k) {
+                let rects: Vec<(i32, i32, i32, i32)> = s90.rects.iter().map(|r| (r.xl, r.yl, r.xh, r.yh)).collect();
+                shapes_45.insert_rects_90(&rects);
+            }
+            for p in shapes_45.polygons_with_holes().map_err(refused)? {
+                all_poly_45_shapes.push((k.li, p));
+            }
+        }
         let mut all_poly_shapes = Vec::new();
-        for (k, mut set) in shapes_by_layer {
-            for p in set.polygons() {
+        for (k, mut s90) in shapes_by_layer {
+            for p in s90.set.polygons() {
                 all_poly_shapes.push((k.li, p));
             }
         }
         let (mut poly_shapes, mut poly_nodes) = (Vec::new(), Vec::new());
         for (li, p) in all_poly_shapes {
             self.process_polygon_to_rectangles(li, p, &mut poly_shapes, &mut poly_nodes);
+        }
+        for (li, p) in &all_poly_45_shapes {
+            self.process_polygon_to_trapezoids(*li, p, &mut poly_shapes, &mut poly_nodes)?;
         }
         for id in poly_nodes {
             self.push_node(id);
@@ -509,6 +841,7 @@ impl<'a> Network<'a> {
                 id += 1;
             }
         }
+        Ok(())
     }
 
     // ---- vias ----------------------------------------------------------------------------------
@@ -614,7 +947,9 @@ impl<'a> Network<'a> {
         };
         let mut out = Vec::new();
         while overlaps(&r, start) {
-            out.push(self.new_node(start, s.li, NodeKind::Node, None));
+            if let Some(pt) = s.filler_point(start, delta.0 != 0) {
+                out.push(self.new_node(pt, s.li, NodeKind::Node, None));
+            }
             start = (start.0 + delta.0, start.1 + delta.1);
         }
         out
@@ -725,9 +1060,12 @@ impl<'a> Network<'a> {
         let mut shared = HashSet::new();
         for (k, nodes) in &self.nodes {
             let shapes = self.shapes.get(k).map(Vec::as_slice).unwrap_or(&[]);
-            let tree = ref_tree(shapes.iter().map(|s| (s.rect, ())).collect());
+            let tree = ref_tree(shapes.iter().enumerate().map(|(i, s)| (s.rect, i)).collect());
             for &n in nodes {
-                if tree.query(&point_rect(self.arena[n].pt)).len() > 1 {
+                // the box of a shape with 45 degree edges can hold a node only in the shape next to it
+                let pt = self.arena[n].pt;
+                let count = tree.query(&point_rect(pt)).into_iter().filter(|e| shapes[e.1].contains(pt)).count();
+                if count > 1 {
                     shared.insert(n);
                 }
             }
@@ -740,6 +1078,14 @@ impl<'a> Network<'a> {
         let mut v: Vec<NodeId> = tree.query(r).into_iter().map(|e| e.1).collect();
         v.sort_by(|a, b| self.compare(*a, *b));
         v.dedup_by(|a, b| self.compare(*a, *b) == Ordering::Equal);
+        v
+    }
+
+    /// `getNodes`: the nodes of a layer in a shape (its box can hold nodes of the shapes next to
+    /// it), in node order.
+    fn shape_nodes(&self, tree: &PackedRTree<NodeId>, s: &Shape) -> Vec<NodeId> {
+        let mut v = self.nodes_on(tree, &s.rect);
+        v.retain(|&n| s.contains(self.arena[n].pt));
         v
     }
 
@@ -776,7 +1122,7 @@ impl<'a> Network<'a> {
     }
 
     fn shape_cleanup_nodes(&mut self, s: &Shape, min_distance: i32, tree: &PackedRTree<NodeId>, shared: &HashSet<NodeId>, map: &mut ConnMap) -> HashSet<NodeId> {
-        let sorted = self.nodes_on(tree, &s.rect);
+        let sorted = self.shape_nodes(tree, s);
         let c = center(&s.rect);
         let (mut center_nodes, mut other_nodes, mut shape_shared) = (Vec::new(), Vec::new(), Vec::new());
         for &n in &sorted {
@@ -913,7 +1259,7 @@ impl<'a> Network<'a> {
     }
 
     fn shape_connect_nodes(&mut self, s: &Shape, layer_tree: &PackedRTree<NodeId>) -> Vec<ConnId> {
-        let sorted = self.nodes_on(layer_tree, &s.rect);
+        let sorted = self.shape_nodes(layer_tree, s);
         let tree = ref_tree(sorted.iter().map(|&n| (point_rect(self.arena[n].pt), n)).collect());
         let mut used: HashSet<NodeId> = HashSet::new();
         let mut out = Vec::new();
@@ -921,10 +1267,8 @@ impl<'a> Network<'a> {
             let pt = self.arena[n].pt;
             used.insert(n);
             let Some(&(_, other)) = tree.nearest_one(pt, |v| !used.contains(v)) else { continue };
-            let op = self.arena[other].pt;
-            let (len_x, len_y) = ((op.0 - pt.0).abs(), (op.1 - pt.1).abs());
-            let (length, width) = if len_x > len_y { (len_x, s.rect.dy()) } else { (len_y, s.rect.dx()) };
-            out.push(self.new_conn(n, other, ConnKind::Layer { length, width }));
+            let size = s.connection_size(pt, self.arena[other].pt);
+            out.push(self.new_conn(n, other, ConnKind::Layer { length: size.length, width: size.width }));
         }
         out
     }
@@ -1039,6 +1383,37 @@ mod tests {
         Network::build(t, n, false, None).unwrap()
     }
 
+    // Upstream 5f0b2d8fb02 + 1d4cb901b1b (check_power_grid_short_iterms' bump): a layer with a
+    // 45-degree shape merges its rectilinear metal into it and is sliced into trapezoids, not
+    // rectangles. An octagon on a strap gives 5 pieces, the octagon's two slanted thirds held as
+    // polygons. A polygon measures a connection across itself square to it, through its middle
+    // (width 1400 at x 13300, not its box's 600), and puts a filler on its own middle line.
+    #[test]
+    fn an_octagon_on_a_strap_is_sliced_into_trapezoids() {
+        let t = tech();
+        let oct = vec![(13000, 11000), (13000, 11800), (13600, 12400), (14400, 12400), (15000, 11800), (15000, 11000), (14400, 10400), (13600, 10400), (13000, 11000)];
+        let n = net(vec![vec![
+            SBox::Oct { layer: 0, rect: r(13000, 10400, 15000, 12400), points: oct },
+            wire(0, r(11000, 11230, 16000, 11570)),
+        ]]);
+        let (nw, _) = build(&t, &n);
+        let shapes: Vec<(Rect, bool)> = nw.shapes.values().flatten().map(|s| (s.rect, s.polygon.is_some())).collect();
+        assert_eq!(
+            shapes,
+            vec![
+                (r(11000, 11230, 13000, 11570), false),
+                (r(13000, 10400, 13600, 12400), true),
+                (r(13600, 10400, 14400, 12400), false),
+                (r(14400, 10400, 15000, 12400), true),
+                (r(15000, 11230, 16000, 11570), false),
+            ]
+        );
+        let slanted = &nw.shapes.values().flatten().nth(1).expect("five shapes");
+        assert_eq!(slanted.connection_size((13000, 11400), (13600, 11400)), ConnectionSize { length: 600, width: 1400 });
+        assert_eq!(slanted.filler_point((13300, 11800), false), Some((13300, 11800)));
+        assert!(slanted.contains((13300, 12100)) && !slanted.contains((13100, 12100)));
+    }
+
     // A horizontal layer is sliced VERTICALLY: an L of a long bar and a stub above it is the stub's
     // column plus the bar either side, three shapes, not the bar plus the stub.
     #[test]
@@ -1066,7 +1441,7 @@ mod tests {
         let t: &'static Tech = Box::leak(Box::new(tech()));
         let mut n = net(vec![]);
         n.supply = false;
-        assert_eq!(Network::build(t, &n, false, None).err().unwrap(), "VDD is not a supply net.");
+        assert_eq!(Network::build(t, &n, false, None).err().unwrap(), BuildError::Error("VDD is not a supply net.".into()));
     }
 
     // A net with no shapes and no terminals is empty: nothing after generation runs.
@@ -1146,11 +1521,11 @@ mod tests {
         let (nw, _) = build(&t, &n);
         // m2's pitch 200 caps the node pitch at 2000: fillers at y 1000, 3000, 5000 — then merged
         // with the centre node (3000) and each other only within a radius of 1000.
-        let s = Shape { rect: r(0, 0, 100, 6000), li: 2, id: 0 };
+        let s = Shape { rect: r(0, 0, 100, 6000), li: 2, id: 0, polygon: None };
         let mut nw = nw;
         let made: Vec<(i32, i32)> = nw.create_filler_nodes(&s, 2000).iter().map(|&i| nw.arena[i].pt).collect();
         assert_eq!(made, vec![(50, 1000), (50, 3000), (50, 5000)]);
-        assert!(nw.create_filler_nodes(&Shape { rect: r(0, 0, 100, 2000), li: 2, id: 0 }, 2000).iter().all(|&i| nw.arena[i].pt.1 < 2000));
+        assert!(nw.create_filler_nodes(&Shape { rect: r(0, 0, 100, 2000), li: 2, id: 0, polygon: None }, 2000).iter().all(|&i| nw.arena[i].pt.1 < 2000));
     }
 
     // Each shape's nodes are chained: every node joins the nearest node of the shape not yet

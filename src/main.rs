@@ -268,7 +268,8 @@ fn check_connectivity<'t>(
     });
     let (network, log) = match vyges_psm::network::Network::build(tech, net_input, floorplanning, dump) {
         Ok(x) => x,
-        Err(e) => {
+        Err(vyges_psm::network::BuildError::Refused(why)) => return Err(refuse(&why)),
+        Err(vyges_psm::network::BuildError::Error(e)) => {
             println!("[ERROR PSM-0087] {e}");
             return Err(ExitCode::from(1));
         }
@@ -577,7 +578,8 @@ fn write_spice(
     };
     let network = match vyges_psm::network::Network::build(tech, net_input, false, None) {
         Ok((n, _)) => n,
-        Err(e) => {
+        Err(vyges_psm::network::BuildError::Refused(why)) => return refuse(&why),
+        Err(vyges_psm::network::BuildError::Error(e)) => {
             println!("[ERROR PSM-0087] {e}");
             return ExitCode::from(1);
         }
