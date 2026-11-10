@@ -1,5 +1,7 @@
 # vyges-psm
 
+**[Download Loom](https://vyges.com/products/vyges-cli/#install)** · install the free [Vyges CLI](https://vyges.com/products/vyges-cli/), then `vyges install physical`
+
 Power-grid analysis on the design database: connectivity check, static IR drop, per-node voltages, SPICE export.
 
 > **Status: in development.** `check`, `analyze` and `write-spice` are built; `activities` is a diagnostic
