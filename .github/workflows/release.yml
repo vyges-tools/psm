@@ -110,7 +110,7 @@ jobs:
         run: brew install cmake boost bison
 
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           targets: ${{ matrix.target }}
       - name: Build
