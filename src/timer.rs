@@ -133,12 +133,12 @@ pub fn activities_and_powers(db: &Db, inp: &TimerInputs<'_>, powers_scene: Optio
 
     let n = g.vertices.len();
     let level = g.levels()?;
-    let clock_source: Vec<bool> = g.vertices.iter().map(|v| clock_sources.contains(&v.name)).collect();
+    let clock_source: Vec<bool> = (0..g.vertices.len()).map(|v| clock_sources.contains(&g.vname(v))).collect();
     let is_clock: Vec<bool> = (0..n).map(|v| search.is_clock(v)).collect();
     let clock: Vec<Option<power::Activity>> = (0..n)
         .map(|v| if is_clock[v] { search.find_clk(v).map(|c| power::clock_activity(c.period, c.waveform[0], c.waveform[1])) } else { None })
         .collect();
-    let constant: Vec<Option<bool>> = g.vertices.iter().map(|x| g.sdc.constants.get(&x.name).copied()).collect();
+    let constant: Vec<Option<bool>> = (0..g.vertices.len()).map(|x| g.sdc.constants.get(&g.vname(x)).copied()).collect();
     let clk_period: Vec<Option<f32>> = (0..n).map(|v| search.find_clk(v).map(|c| c.period)).collect();
     let min_rf_slew: Vec<f32> = (0..n).map(|v| graphs.iter().map(|gk| min_rf_slew(&gk.slew[v])).fold(f32::INFINITY, f32::min)).collect();
     let min_period = if ssdc.clocks.is_empty() { 0.0 } else { ssdc.clocks.iter().map(|c| c.period).fold(f32::INFINITY, f32::min) };
@@ -154,7 +154,7 @@ pub fn activities_and_powers(db: &Db, inp: &TimerInputs<'_>, powers_scene: Optio
         if gk.vertices[v].is_driver {
             Some(v)
         } else {
-            gk.vertices.get(v + 1).filter(|w| w.is_driver && w.name == gk.vertices[v].name).map(|_| v + 1)
+            gk.vertices.get(v + 1).filter(|w| w.is_driver && w.conn == gk.vertices[v].conn).map(|_| v + 1)
         }
     };
     let no_parasitics = HashMap::new();
