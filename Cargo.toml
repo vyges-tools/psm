@@ -16,12 +16,12 @@ serde_json = "1"
 vyges-events = { git = "https://github.com/vyges-tools/events", branch = "main", default-features = false }
 # The design database. Optional so the network code builds and tests without it; ON by default so a
 # plain `cargo test` covers the read too.
-vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main", optional = true }
+vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "repin-f11b4276", optional = true }
 # Manhattan polygon sets (merging, slicing into rectangles) and the packed R-tree with its nearest
 # query: the router's transcriptions, geometry only (no database, no threads).
-vyges-drt = { git = "https://github.com/vyges-tools/drt", branch = "main", default-features = false }
+vyges-drt = { git = "https://github.com/vyges-tools/drt", branch = "repin-f11b4276", default-features = false }
 # Liberty: the default library's operating-conditions voltage.
-vyges-sta = { git = "https://github.com/vyges-tools/sta.git", branch = "main" }
+vyges-sta = { git = "https://github.com/vyges-tools/sta.git", branch = "repin-f11b4276" }
 # Gzipped liberty files.
 miniz_oxide = "0.8"
 # The solve's sparse LU: a transcription of the pinned Eigen SparseLU, bit for bit (MPL-2.0, its own
@@ -30,10 +30,10 @@ vyges-sparselu = { git = "https://github.com/vyges-tools/sparselu", branch = "ma
 
 # The instance power's timer: the database's netlist and the constraints in the timer's form, as
 # the resizer and the router build them (`timer::netlist`, `env::search_sdc_on`, `env::sdc_env`).
-vyges-rsz = { git = "https://github.com/vyges-tools/rsz.git", branch = "main", features = ["cli"], optional = true }
-vyges-grt = { git = "https://github.com/vyges-tools/grt.git", branch = "main", default-features = false, features = ["odb"], optional = true }
-vyges-est = { git = "https://github.com/vyges-tools/est.git", branch = "main", features = ["odb"], optional = true }
-vyges-loom = { git = "https://github.com/vyges-tools/loom.git", branch = "main", optional = true }
+vyges-rsz = { git = "https://github.com/vyges-tools/rsz.git", branch = "repin-f11b4276", features = ["cli"], optional = true }
+vyges-grt = { git = "https://github.com/vyges-tools/grt.git", branch = "repin-f11b4276", default-features = false, features = ["odb"], optional = true }
+vyges-est = { git = "https://github.com/vyges-tools/est.git", branch = "repin-f11b4276", features = ["odb"], optional = true }
+vyges-loom = { git = "https://github.com/vyges-tools/loom.git", branch = "repin-f11b4276", optional = true }
 
 # The binary's global allocator. The reference build links tcmalloc for all of its code
 # (BUILD.bazel `malloc = @tcmalloc`), not the system allocator; mimalloc measured fastest and

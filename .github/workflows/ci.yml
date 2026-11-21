@@ -35,8 +35,9 @@ jobs:
         working-directory: .
         run: |
           set -eu
-          ref=main
           for r in sta opendb opendb-lib sparselu rsz grt est stt dpl drt loom; do
+            # repin branch where the sibling has one; back to main at the merge
+            case $r in sparselu|stt) ref=main ;; *) ref=repin-f11b4276 ;; esac
             git clone -q --depth 1 --branch "$ref" "https://github.com/vyges-tools/$r" "vyges-tools-$r"
             echo "vyges-tools-$r @ $ref $(git -C vyges-tools-$r rev-parse --short HEAD)"
           done
