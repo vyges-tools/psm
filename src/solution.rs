@@ -4,10 +4,12 @@
 //!
 //! What the reference keeps per net, per corner, until the design is edited:
 //!
-//! - the supply voltage of the last solve. It is kept even through a failed solve, and a LATER
-//!   solve of the same power net takes it as the power net's voltage before the user's setting;
+//! - the supply voltage of the last COMPLETED solve, which `write_pg_spice` takes as the power
+//!   net's voltage before the user's setting. A solve clears the whole solution first (OpenROAD
+//!   #12319), so it never feeds the next solve's voltage, and a failed solve leaves none;
 //! - the node voltages and the node currents. A solution is reusable (`-allow_reuse`) only when
-//!   it has both; `write_pg_spice` needs only that the solve STARTED (its currents may be empty);
+//!   it has both; `write_pg_spice` needs only that the solve got past the resistance check (its
+//!   currents may be empty);
 //! - the total power, which the reused report prints.
 //!
 //! Any edit to the design drops every solution. Here the design's fingerprint (its file's bytes)
@@ -20,7 +22,8 @@ use crate::network::NodeId;
 pub struct Solution {
     pub net: String,
     pub corner: String,
-    pub src_voltage: f64,
+    /// The supply voltage (`solution_voltages_`): set when the solve completes.
+    pub src_voltage: Option<f64>,
     pub total_power: f32,
     /// Reusable: the solve produced voltages and drew current.
     pub has_solution: bool,
@@ -35,7 +38,7 @@ pub struct Store {
     pub solutions: Vec<Solution>,
 }
 
-const MAGIC: &str = "vyges-psm-solutions 2";
+const MAGIC: &str = "vyges-psm-solutions 3";
 
 /// The design's fingerprint: FNV-1a over its bytes.
 pub fn fingerprint(bytes: &[u8]) -> u64 {
@@ -83,7 +86,7 @@ impl Store {
             store.solutions.push(Solution {
                 net: net.into(),
                 corner: corner.into(),
-                src_voltage: hex64(src)?,
+                src_voltage: if src == "-" { None } else { Some(hex64(src)?) },
                 total_power: f32::from_bits(u32::from_str_radix(power, 16).map_err(|_| bad("power"))?),
                 has_solution: has == "1",
                 voltages,
@@ -98,10 +101,10 @@ impl Store {
         let mut out = format!("{MAGIC}\ndesign {:016x}\n", self.design);
         for s in &self.solutions {
             out += &format!(
-                "solution {} {} {:016x} {:08x} {} {}\n",
+                "solution {} {} {} {:08x} {} {}\n",
                 s.net,
                 s.corner,
-                s.src_voltage.to_bits(),
+                s.src_voltage.map_or("-".to_string(), |v| format!("{:016x}", v.to_bits())),
                 s.total_power.to_bits(),
                 u8::from(s.has_solution),
                 s.voltages.len()
@@ -127,15 +130,17 @@ impl Store {
         self.solutions.push(s);
     }
 
-    /// A solve has started: the net's voltages and currents on the corner are reset (no longer
-    /// reusable; still present, so `write_pg_spice` writes no sinks rather than failing), but its
-    /// supply voltage and power are kept until the solve stores new ones.
-    pub fn reset(&mut self, net: &str, corner: &str) {
-        if let Some(s) = self.solutions.iter_mut().find(|s| s.net == net && s.corner == corner) {
-            s.has_solution = false;
-            s.voltages.clear();
-            s.currents.clear();
-        }
+    /// `IRSolver::clearSolution(corner)`: the net's solution on the corner is gone — voltages,
+    /// currents, supply voltage and power (`write_pg_spice` then has no solution, PSM-0092).
+    pub fn clear(&mut self, net: &str, corner: &str) {
+        self.solutions.retain(|s| !(s.net == net && s.corner == corner));
+    }
+
+    /// The solve got past its resistance check (`voltages_[corner]`, `currents_[corner]`): an
+    /// empty solution, not reusable and with no supply voltage, that `write_pg_spice` writes with
+    /// no sinks rather than failing.
+    pub fn start(&mut self, net: &str, corner: &str) {
+        self.put(Solution { net: net.into(), corner: corner.into(), src_voltage: None, total_power: 0.0, has_solution: false, voltages: Vec::new(), currents: Vec::new() });
     }
 }
 
@@ -144,7 +149,7 @@ mod tests {
     use super::*;
 
     fn sol(net: &str, v: f64) -> Solution {
-        Solution { net: net.into(), corner: "default".into(), src_voltage: 1.1, total_power: 1.38e-4, has_solution: true, voltages: vec![(3, v), (7, -0.0)], currents: vec![(7, 2.5e-7)] }
+        Solution { net: net.into(), corner: "default".into(), src_voltage: Some(1.1), total_power: 1.38e-4, has_solution: true, voltages: vec![(3, v), (7, -0.0)], currents: vec![(7, 2.5e-7)] }
     }
 
     // The file keeps every value to the bit (a negative zero included) and reads back as written.
@@ -167,17 +172,22 @@ mod tests {
         assert!(Store::parse("junk", 1).is_err());
     }
 
-    // A solve resets the net's voltages (no longer reusable) but keeps its supply voltage: a later
-    // solve of the power net takes the previous solution's voltage.
+    // Upstream rule (`IRSolver::solve`, OpenROAD #12319): a solve clears the whole solution
+    // first, the supply voltage too, so the previous solve's voltage never feeds the next; past
+    // the resistance check an empty solution exists (no supply voltage), and the file says so.
     #[test]
-    fn a_reset_keeps_the_supply_voltage() {
+    fn a_solve_clears_the_supply_voltage_too() {
         let mut s = Store::default();
         s.put(sol("VDD", 1.0));
-        s.reset("VDD", "default");
+        s.put(sol("VSS", 1.0));
+        s.clear("VDD", "default");
+        assert!(s.get("VDD", "default").is_none() && s.get("VSS", "default").is_some());
+        s.start("VDD", "default");
         let e = s.get("VDD", "default").unwrap();
         assert!(!e.has_solution && e.voltages.is_empty() && e.currents.is_empty());
-        assert_eq!(e.src_voltage, 1.1);
+        assert_eq!(e.src_voltage, None);
+        assert_eq!(Store::parse(&s.text(), 0).unwrap(), s);
         s.put(sol("VDD", 2.0));
-        assert_eq!(s.solutions.len(), 1);
+        assert_eq!(s.solutions.len(), 2);
     }
 }

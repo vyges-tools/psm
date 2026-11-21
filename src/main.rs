@@ -450,10 +450,10 @@ fn analyze(args: &[String], spice: bool) -> ExitCode {
     };
     let c = Call { db: &db, net: &net, net_id, tech: &tech, net_input: &net_input, inputs: &inputs, session: &session, o: &o, network: &network, dump_dir: dump_dir.as_deref() };
     let previous = store.as_ref().and_then(|s| s.get(&net, &session.corner)).cloned();
-    let solved = match previous.filter(|p| allow_reuse && p.has_solution) {
-        Some(p) => {
+    let solved = match previous.filter(|p| allow_reuse && p.has_solution).and_then(|p| Some((p.src_voltage?, p))) {
+        Some((src_voltage, p)) => {
             println!("[INFO PSM-0011] Reusing previous solution");
-            Solved { voltages: p.voltages.into_iter().collect(), src_voltage: p.src_voltage, total_power: p.total_power, cond: None }
+            Solved { voltages: p.voltages.into_iter().collect(), src_voltage, total_power: p.total_power, cond: None }
         }
         None => match solve_net(&c, &mut store, save_solution.as_deref()) {
             Ok(s) => s,
@@ -597,7 +597,7 @@ fn write_spice(
         Ok(r) => r,
         Err(code) => return code,
     };
-    let previous = Some(solution.src_voltage);
+    let previous = solution.src_voltage;
     let power_voltage = || solve::power_net_voltage(inputs.sig, c.net_id, &session.voltages, &session.corner, previous, session.pvt);
     let Some(net_voltage) = solve::net_voltage(inputs.sig, power_voltage) else {
         return fail(&[format!("[ERROR PSM-0079] Cannot determine the supply voltage for {net}.")]);
@@ -695,18 +695,21 @@ fn resistances(c: &Call) -> Result<Vec<f64>, ExitCode> {
     Ok(solve::resistance_map(c.inputs, c.tech.dbus, &estimate))
 }
 
-/// The solve (`IRSolver::solve`), in its order. The power net's voltage is the previous solution's
-/// on this corner when there is one; the stored solution is reset once the resistances are checked
-/// and replaced at the end.
+/// The solve (`IRSolver::solve`), in its order. It clears the net's solution on the corner first
+/// (OpenROAD #12319), so the power net's voltage is never the previous solution's; an empty
+/// solution exists once the resistances are checked, and is replaced at the end.
 fn solve_net(c: &Call, store: &mut Option<vyges_psm::solution::Store>, save: Option<&str>) -> Result<Solved, ExitCode> {
     use vyges_psm::solve;
     let (s, network, net) = (c.session, c.network, c.net);
-    let previous = store.as_ref().and_then(|st| st.get(net, &s.corner)).map(|p| p.src_voltage);
-    let power_voltage = || solve::power_net_voltage(c.inputs.sig, c.net_id, &s.voltages, &s.corner, previous, s.pvt);
+    if let Some(st) = store.as_mut() {
+        st.clear(net, &s.corner);
+    }
+    save_store(store, save)?;
+    let power_voltage = || solve::power_net_voltage(c.inputs.sig, c.net_id, &s.voltages, &s.corner, None, s.pvt);
     let res = resistances(c)?;
     solve::assert_resistance_map(network, c.inputs, &res).map_err(|lines| fail(&lines))?;
     if let Some(st) = store.as_mut() {
-        st.reset(net, &s.corner);
+        st.start(net, &s.corner);
     }
     save_store(store, save)?;
     let net_voltage = solve::net_voltage(c.inputs.sig, power_voltage)
@@ -759,7 +762,7 @@ fn solve_net(c: &Call, store: &mut Option<vyges_psm::solution::Store>, save: Opt
         st.put(vyges_psm::solution::Solution {
             net: net.to_string(),
             corner: s.corner.clone(),
-            src_voltage,
+            src_voltage: Some(src_voltage),
             total_power,
             has_solution: !voltages.is_empty() && !currents.is_empty(),
             voltages: kept,
