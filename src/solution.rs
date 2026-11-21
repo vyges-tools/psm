@@ -12,6 +12,12 @@
 //!   currents may be empty);
 //! - the total power, which the reused report prints.
 //!
+//! A user setting (`set_pdnsim_net_voltage`, `set_pdnsim_inst_power`) drops every solution on its
+//! corner when it is the first for its object there or changes the value (OpenROAD #12056,
+//! #12319); the same value again keeps them. Each call carries the session's settings, so the
+//! store keeps the last ones seen and compares (a value set and set back between two calls is not
+//! seen).
+//!
 //! Any edit to the design drops every solution. Here the design's fingerprint (its file's bytes)
 //! stands in for "not edited": a store written for another fingerprint is empty.
 
@@ -32,9 +38,19 @@ pub struct Solution {
     pub currents: Vec<(NodeId, f64)>,
 }
 
+/// One user setting: its object (`net:NAME` or `inst:NAME`), corner and value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Setting {
+    pub object: String,
+    pub corner: String,
+    pub value: f64,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Store {
     pub design: u64,
+    /// The user settings last seen, in the order first set.
+    pub settings: Vec<Setting>,
     pub solutions: Vec<Solution>,
 }
 
@@ -70,11 +86,16 @@ impl Store {
         let fp = lines.next().and_then(|l| l.strip_prefix("design ")).ok_or_else(|| bad("design"))?;
         let fp = u64::from_str_radix(fp, 16).map_err(|_| bad("design"))?;
         if fp != design {
-            return Ok(Store { design, solutions: Vec::new() });
+            return Ok(Store { design, ..Store::default() });
         }
-        let mut store = Store { design, solutions: Vec::new() };
+        let mut store = Store { design, ..Store::default() };
         while let Some(head) = lines.next() {
             let w: Vec<&str> = head.split(' ').collect();
+            if let ["setting", object, corner, value] = w[..] {
+                let value = u64::from_str_radix(value, 16).map(f64::from_bits).map_err(|_| bad("setting"))?;
+                store.settings.push(Setting { object: object.into(), corner: corner.into(), value });
+                continue;
+            }
             let [tag, net, corner, src, power, has, n] = w[..] else { return Err(bad("solution header")) };
             if tag != "solution" {
                 return Err(bad("solution header"));
@@ -99,6 +120,9 @@ impl Store {
     /// The file's text: every value as IEEE bits, so a reused solution is the solved one exactly.
     pub fn text(&self) -> String {
         let mut out = format!("{MAGIC}\ndesign {:016x}\n", self.design);
+        for s in &self.settings {
+            out += &format!("setting {} {} {:016x}\n", s.object, s.corner, s.value.to_bits());
+        }
         for s in &self.solutions {
             out += &format!(
                 "solution {} {} {} {:08x} {} {}\n",
@@ -136,6 +160,28 @@ impl Store {
         self.solutions.retain(|s| !(s.net == net && s.corner == corner));
     }
 
+    /// `PDNSim::clearSolutions(corner)`: every net's solution on the corner is gone.
+    pub fn clear_corner(&mut self, corner: &str) {
+        self.solutions.retain(|s| s.corner != corner);
+    }
+
+    /// `PDNSim::setNetVoltage` / `setInstPower`, each given setting in order: the first for its
+    /// object and corner, or a changed value (`!=`), clears the corner's solutions (OpenROAD
+    /// #12056, #12319); the same value keeps them. Whether anything changed.
+    pub fn apply_settings(&mut self, given: &[Setting]) -> bool {
+        let mut changed = false;
+        for g in given {
+            match self.settings.iter_mut().find(|s| s.object == g.object && s.corner == g.corner) {
+                Some(s) if s.value == g.value => continue,
+                Some(s) => s.value = g.value,
+                None => self.settings.push(g.clone()),
+            }
+            self.clear_corner(&g.corner);
+            changed = true;
+        }
+        changed
+    }
+
     /// The solve got past its resistance check (`voltages_[corner]`, `currents_[corner]`): an
     /// empty solution, not reusable and with no supply voltage, that `write_pg_spice` writes with
     /// no sinks rather than failing.
@@ -155,7 +201,8 @@ mod tests {
     // The file keeps every value to the bit (a negative zero included) and reads back as written.
     #[test]
     fn the_store_reads_back_exactly() {
-        let mut s = Store { design: 42, solutions: vec![] };
+        let mut s = Store { design: 42, ..Store::default() };
+        s.apply_settings(&[set("net:VDD", "default", 1.1)]);
         s.put(sol("VDD", 1.0999999999999999));
         s.put(sol("VSS", 1e-300));
         let back = Store::parse(&s.text(), 42).unwrap();
@@ -166,10 +213,39 @@ mod tests {
     // Any edit to the design drops every solution: a store of another design reads empty.
     #[test]
     fn another_design_reads_empty() {
-        let mut s = Store { design: fingerprint(b"one"), solutions: vec![] };
+        let mut s = Store { design: fingerprint(b"one"), ..Store::default() };
         s.put(sol("VDD", 1.0));
         assert!(Store::parse(&s.text(), fingerprint(b"two")).unwrap().solutions.is_empty());
         assert!(Store::parse("junk", 1).is_err());
+    }
+
+    fn set(object: &str, corner: &str, value: f64) -> Setting {
+        Setting { object: object.into(), corner: corner.into(), value }
+    }
+
+    // Upstream rule (`PDNSim::setNetVoltage` / `setInstPower`, OpenROAD #12056 then #12319): a
+    // setting clears every net's solution on its corner when it is the first for its object
+    // there or changes the value; the same value again keeps them; another corner is untouched.
+    #[test]
+    fn a_first_or_changed_setting_clears_its_corner() {
+        let mut s = Store::default();
+        let full = |s: &mut Store| {
+            s.put(sol("VDD", 1.0));
+            s.put(sol("VSS", 1.0));
+            s.put(Solution { corner: "slow".into(), ..sol("VDD", 1.0) });
+        };
+        full(&mut s);
+        assert!(s.apply_settings(&[set("net:VDD", "default", 1.1)]), "first set after a solve");
+        assert_eq!(s.solutions.len(), 1, "only the other corner's solution is left");
+        full(&mut s);
+        assert!(!s.apply_settings(&[set("net:VDD", "default", 1.1)]), "same value");
+        assert_eq!(s.solutions.len(), 3);
+        assert!(s.apply_settings(&[set("net:VDD", "default", 1.5)]), "changed value");
+        assert_eq!(s.solutions.len(), 1);
+        full(&mut s);
+        assert!(s.apply_settings(&[set("net:VDD", "default", 1.5), set("inst:_440_", "default", 1e-3)]), "first instance power");
+        assert_eq!(s.solutions.len(), 1);
+        assert_eq!(s.settings, [set("net:VDD", "default", 1.5), set("inst:_440_", "default", 1e-3)]);
     }
 
     // Upstream rule (`IRSolver::solve`, OpenROAD #12319): a solve clears the whole solution

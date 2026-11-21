@@ -448,6 +448,12 @@ fn analyze(args: &[String], spice: bool) -> ExitCode {
         },
         None => None,
     };
+    // The session's settings, as the set commands before this call made them.
+    if store.as_mut().is_some_and(|st| st.apply_settings(&session.user_sets)) {
+        if let Err(code) = save_store(&store, save_solution.as_deref()) {
+            return code;
+        }
+    }
     let c = Call { db: &db, net: &net, net_id, tech: &tech, net_input: &net_input, inputs: &inputs, session: &session, o: &o, network: &network, dump_dir: dump_dir.as_deref() };
     let previous = store.as_ref().and_then(|s| s.get(&net, &session.corner)).cloned();
     let solved = match previous.filter(|p| allow_reuse && p.has_solution).and_then(|p| Some((p.src_voltage?, p))) {
@@ -570,13 +576,19 @@ fn write_spice(
     path: &str,
 ) -> ExitCode {
     use vyges_psm::solve;
-    let store = match save_solution {
+    let mut store = match save_solution {
         Some(p) => match load_store(p, design) {
             Ok(s) => Some(s),
             Err(code) => return code,
         },
         None => None,
     };
+    // The session's settings, as the set commands before this call made them.
+    if store.as_mut().is_some_and(|st| st.apply_settings(&session.user_sets)) {
+        if let Err(code) = save_store(&store, save_solution) {
+            return code;
+        }
+    }
     let Some(solution) = store.as_ref().and_then(|s| s.get(net, &session.corner)) else {
         return fail(&[format!("[ERROR PSM-0092] No solution available for {net} on corner {}. Run analyze_power_grid first.", session.corner)]);
     };
@@ -661,7 +673,7 @@ fn load_store(path: &str, design: &str) -> Result<vyges_psm::solution::Store, Ex
     })?;
     let fp = fingerprint(&bytes);
     match std::fs::read_to_string(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Store { design: fp, solutions: Vec::new() }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Store { design: fp, ..Store::default() }),
         Err(e) => {
             eprintln!("vyges-psm: cannot read {path}: {e}");
             Err(ExitCode::from(2))
@@ -868,6 +880,8 @@ struct Session {
     /// `--inst-power`: each instance's power given, in place of the timer's (a diagnostic).
     timer_power: Option<std::collections::HashMap<String, f32>>,
     user_power: std::collections::HashMap<String, f32>,
+    /// Every user setting given (`--net-voltage`, `--user-power`, every corner), in order.
+    user_sets: Vec<vyges_psm::solution::Setting>,
     pvt: Option<f32>,
     units: vyges_psm::solve::RcUnits,
     layer_rcs: Vec<Vec<String>>,
@@ -891,9 +905,11 @@ fn analyze_session(db: &vyges_opendb::Db, o: &AnalyzeOpts) -> Result<Session, Ex
         Some((name.to_string(), v.to_string(), c.to_string()))
     };
     let mut voltages = Vec::new();
+    let mut user_sets = Vec::new();
     for s in &o.net_voltages {
         let (name, v, c) = split(s).ok_or_else(|| usage_error(&format!("bad --net-voltage `{s}`")))?;
         let voltage = v.parse::<f64>().map_err(|_| usage_error(&format!("bad voltage `{v}`")))?;
+        user_sets.push(vyges_psm::solution::Setting { object: format!("net:{name}"), corner: c.clone(), value: voltage });
         let net_id = db.net_id(&name).map_err(|e| usage_error(&format!("net {name}: {e}")))?;
         voltages.push(solve::UserVoltage { net_id, power: db.net_sigtype(&name) == "POWER", corner: c, voltage });
     }
@@ -901,6 +917,7 @@ fn analyze_session(db: &vyges_opendb::Db, o: &AnalyzeOpts) -> Result<Session, Ex
     for s in &o.user_powers {
         let (name, v, c) = split(s).ok_or_else(|| usage_error(&format!("bad --user-power `{s}`")))?;
         let power = v.parse::<f32>().map_err(|_| usage_error(&format!("bad power `{v}`")))?;
+        user_sets.push(vyges_psm::solution::Setting { object: format!("inst:{name}"), corner: c.clone(), value: f64::from(power) });
         if c == corner {
             user_power.insert(name, power);
         }
@@ -939,7 +956,7 @@ fn analyze_session(db: &vyges_opendb::Db, o: &AnalyzeOpts) -> Result<Session, Ex
         }
     };
     let layer_rcs = o.layer_rcs.iter().map(|r| r.split_whitespace().map(String::from).collect()).collect();
-    Ok(Session { corner, settings, source_type, voltages, timer_power, user_power, pvt, units, layer_rcs })
+    Ok(Session { corner, settings, source_type, voltages, timer_power, user_power, user_sets, pvt, units, layer_rcs })
 }
 
 /// One settings command's words: `-bump_dx N -bump_dy N -bump_size N -bump_interval N
