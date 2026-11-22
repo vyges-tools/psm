@@ -86,7 +86,7 @@ const DESCRIBE: &str = r#"{
     "check refuses (exit 3) on an octilinear special wire of another net, a pin layer mixing a polygon off the Manhattan grid with other metal, and an off-grid obstruction polygon.",
     "analyze and write-spice are built end to end; a solution is kept between calls only through --save-solution (write-spice reads it).",
     "The described call is `analyze`: the net's connectivity checked, then its static IR drop solved and the IR report printed (supply voltage, worst and average voltage, worst and average drop, percentage drop).",
-    "Instance power is computed by the timer from `liberty` and `sdc` (switching activity propagated from the clocks and the default input activity, then internal, switching and leakage power per instance), as the solve needs it. Without `liberty` no instance has a liberty cell and the power is `user_power` alone. A timer this build does not reproduce (liberty k_ scale factors, set_clock_transition, more than one constraints file) refuses (exit 3) rather than solving at 0 W. `inst_power` replaces the timer's power with the file's, for diagnosis. `liberty` also gives the supply voltage (its nominal voltage) and the RC units; without it or `net_voltage` the supply voltage is unknown and analyze stops (PSM-0079, exit 1).",
+    "Instance power is computed by the timer from `liberty` and `sdc` (switching activity propagated from the clocks and the default input activity, then internal, switching and leakage power per instance), as the solve needs it. Without `liberty` no instance has a liberty cell and the power is `user_power` alone. A timer this build does not reproduce (liberty k_ scale factors, set_clock_transition, more than one constraints file) refuses (exit 3) rather than solving at 0 W. `inst_power` replaces the timer's power with the file's, for diagnosis. `liberty` also gives the supply voltage (its nominal voltage) and the RC units; without it, `net_voltage` or an SDC `set_voltage` the supply voltage is unknown and analyze stops (PSM-0079, exit 1). The power net's voltage is the user's (`net_voltage`), else the SDC `set_voltage` (the net's own, else the global one), else the library's; `set_voltage` is taken out of the constraints the timer reads (it never reads it). SDC `set_operating_conditions` refuses (exit 3).",
     "`analyze` prints its report; it has no --json output (a --json is refused as an unknown option, exit 2), so emits_json is false and the result is the printed report.",
     "analyze sets no IR-drop or current limit, so it establishes no pass/fail claim: the assertion is not_applicable. A net whose shapes are not all connected stops the call with exit 1 (PSM-0069) before any solve. EM reporting, a saved solution and repeated `net_voltage` or `user_power` entries need the engine's own arguments.",
     "input_hash covers the argument vector, not the content of the database, source, power or Liberty files it names."
@@ -610,7 +610,7 @@ fn write_spice(
         Err(code) => return code,
     };
     let previous = solution.src_voltage;
-    let power_voltage = || solve::power_net_voltage(inputs.sig, c.net_id, &session.voltages, &session.corner, previous, session.pvt);
+    let power_voltage = || solve::power_net_voltage(inputs.sig, c.net_id, &session.voltages, &session.corner, previous, |id| session.sdc_voltage(id), session.pvt);
     let Some(net_voltage) = solve::net_voltage(inputs.sig, power_voltage) else {
         return fail(&[format!("[ERROR PSM-0079] Cannot determine the supply voltage for {net}.")]);
     };
@@ -717,7 +717,7 @@ fn solve_net(c: &Call, store: &mut Option<vyges_psm::solution::Store>, save: Opt
         st.clear(net, &s.corner);
     }
     save_store(store, save)?;
-    let power_voltage = || solve::power_net_voltage(c.inputs.sig, c.net_id, &s.voltages, &s.corner, None, s.pvt);
+    let power_voltage = || solve::power_net_voltage(c.inputs.sig, c.net_id, &s.voltages, &s.corner, None, |id| s.sdc_voltage(id), s.pvt);
     let res = resistances(c)?;
     solve::assert_resistance_map(network, c.inputs, &res).map_err(|lines| fail(&lines))?;
     if let Some(st) = store.as_mut() {
@@ -793,7 +793,7 @@ fn solve_net(c: &Call, store: &mut Option<vyges_psm::solution::Store>, save: Opt
 fn report(c: &Call, sol: &Solved) -> Result<(), ExitCode> {
     use vyges_psm::solve;
     let s = c.session;
-    let power_voltage = solve::power_net_voltage(c.inputs.sig, c.net_id, &s.voltages, &s.corner, Some(sol.src_voltage), s.pvt)
+    let power_voltage = solve::power_net_voltage(c.inputs.sig, c.net_id, &s.voltages, &s.corner, Some(sol.src_voltage), |id| s.sdc_voltage(id), s.pvt)
         .ok_or_else(|| fail(&[format!("[ERROR PSM-0079] Cannot determine the supply voltage for {}.", c.net)]))?;
     let results = solve::get_solution(&c.network.nodes, &sol.voltages, sol.src_voltage, sol.total_power, power_voltage)
         .ok_or_else(|| refuse("a grid node outside the matrix"))?;
@@ -854,17 +854,15 @@ fn timer_power(c: &Call) -> Result<std::collections::HashMap<String, f32>, ExitC
         let text = read_maybe_gz(f).map_err(|e| usage_error(&format!("cannot read {f}: {e}")))?;
         liberties.push((corner.clone(), text));
     }
-    let mut sdcs = Vec::new();
-    for f in &o.sdcs {
-        sdcs.push(std::fs::read_to_string(f).map_err(|e| usage_error(&format!("cannot read {f}: {e}")))?);
-    }
+    // the constraints less their `set_voltage` commands, which the timer never reads
+    let sdcs = &c.session.timer_sdcs;
     // `-corner`: that scene; without corners defined, the one scene.
     let scene = if o.corners.is_empty() {
         0
     } else {
         o.corners.iter().position(|k| *k == c.session.corner).ok_or_else(|| usage_error(&format!("--corner {}: corner not defined", c.session.corner)))?
     };
-    let inputs = vyges_psm::timer::TimerInputs { corners: &o.corners, liberties: &liberties, sdcs: &sdcs };
+    let inputs = vyges_psm::timer::TimerInputs { corners: &o.corners, liberties: &liberties, sdcs };
     vyges_psm::timer::instance_powers(c.db, &inputs, scene).map_err(|e| {
         eprintln!("vyges-psm: instance power: {e}");
         refuse("this design's instance power")
@@ -883,8 +881,20 @@ struct Session {
     /// Every user setting given (`--net-voltage`, `--user-power`, every corner), in order.
     user_sets: Vec<vyges_psm::solution::Setting>,
     pvt: Option<f32>,
+    /// `set_voltage` from the constraints, by net id (`--sdc`; see `vyges_psm::sdc_voltage`).
+    sdc_net_voltages: Vec<(u32, f32)>,
+    sdc_global_voltage: Option<f32>,
+    /// The constraint texts the timer reads: `set_voltage` taken out, a file left empty dropped.
+    timer_sdcs: Vec<String>,
     units: vyges_psm::solve::RcUnits,
     layer_rcs: Vec<Vec<String>>,
+}
+
+impl Session {
+    /// `IRSolver::getSDCVoltage` for net `id`: its own `set_voltage`, else the global one.
+    fn sdc_voltage(&self, id: u32) -> Option<f32> {
+        self.sdc_net_voltages.iter().find(|(n, _)| *n == id).map(|(_, v)| *v).or(self.sdc_global_voltage)
+    }
 }
 
 fn analyze_session(db: &vyges_opendb::Db, o: &AnalyzeOpts) -> Result<Session, ExitCode> {
@@ -934,11 +944,26 @@ fn analyze_session(db: &vyges_opendb::Db, o: &AnalyzeOpts) -> Result<Session, Ex
             }
         }
     }
+    let mut texts = Vec::new();
     for f in &o.sdcs {
         let text = std::fs::read_to_string(f).map_err(|e| usage_error(&format!("cannot read {f}: {e}")))?;
-        if text.lines().any(|l| matches!(l.split_whitespace().next(), Some("set_voltage" | "set_operating_conditions"))) {
-            eprintln!("vyges-psm: {f} sets a voltage or operating conditions; reading them is not built");
-            return Err(refuse("an SDC supply voltage"));
+        // the operating conditions are the timer's PVT too (delays, power): not modelled
+        if text.lines().any(|l| l.split_whitespace().next() == Some("set_operating_conditions")) {
+            eprintln!("vyges-psm: {f} sets operating conditions; reading them is not built");
+            return Err(refuse("SDC operating conditions"));
+        }
+        texts.push(text);
+    }
+    let (sdc_v, timer_sdcs) = vyges_psm::sdc_voltage::split_set_voltage(&texts).map_err(|e| {
+        eprintln!("vyges-psm: set_voltage: {e}");
+        refuse("this set_voltage")
+    })?;
+    let mut sdc_net_voltages = Vec::new();
+    for (name, v) in &sdc_v.nets {
+        // `get_nets_arg` on a name the design lacks warns and names nothing
+        match db.net_id(name) {
+            Ok(id) => sdc_net_voltages.push((id, *v)),
+            Err(_) => eprintln!("vyges-psm: set_voltage -object_list {name}: no such net; only the global voltage is set"),
         }
     }
     let (pvt, units) = match o.liberties.first().map(|(_, f)| f) {
@@ -956,7 +981,7 @@ fn analyze_session(db: &vyges_opendb::Db, o: &AnalyzeOpts) -> Result<Session, Ex
         }
     };
     let layer_rcs = o.layer_rcs.iter().map(|r| r.split_whitespace().map(String::from).collect()).collect();
-    Ok(Session { corner, settings, source_type, voltages, timer_power, user_power, user_sets, pvt, units, layer_rcs })
+    Ok(Session { corner, settings, source_type, voltages, timer_power, user_power, user_sets, pvt, sdc_net_voltages, sdc_global_voltage: sdc_v.global, timer_sdcs, units, layer_rcs })
 }
 
 /// One settings command's words: `-bump_dx N -bump_dy N -bump_size N -bump_interval N

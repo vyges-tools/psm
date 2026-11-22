@@ -783,14 +783,19 @@ pub struct UserVoltage {
 
 /// The voltage the power net is at. The power net is the analysed net when it is a power net,
 /// else the first power net (by database id) the user set a voltage on. Its voltage: a previous
-/// solution of the same net on this corner, else the user's for this corner, else the default
-/// library's default operating conditions. `None` when none applies.
+/// solution of the same net on this corner, else the user's for this corner, else the SDC's
+/// (`set_voltage`: the net's own, else the global one; `getSDCVoltage`), else the default
+/// library's default operating conditions. `None` when none applies. `sdc` answers a net id.
+///
+/// 🔑 `IRSolver::getPowerNetVoltage`'s order: solution > user > SDC > PVT. The SDC voltage is
+/// asked only when there IS a power net, as the reference asks it inside `if (net != nullptr)`.
 pub fn power_net_voltage(
     sig: SigType,
     net_id: u32,
     user: &[UserVoltage],
     corner: &str,
     previous_solution: Option<f64>,
+    sdc: impl Fn(u32) -> Option<f32>,
     pvt: Option<f32>,
 ) -> Option<f64> {
     let mut by_id: Vec<&UserVoltage> = user.iter().collect();
@@ -805,6 +810,9 @@ pub fn power_net_voltage(
         // The last setting for (net, corner) is the one kept.
         if let Some(u) = user.iter().rev().find(|u| u.net_id == p && u.corner == corner) {
             return Some(u.voltage);
+        }
+        if let Some(v) = sdc(p) {
+            return Some(f64::from(v));
         }
     }
     pvt.map(f64::from)

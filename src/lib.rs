@@ -12,6 +12,7 @@ pub mod check;
 pub mod input;
 pub mod network;
 pub mod polygon45;
+pub mod sdc_voltage;
 pub mod short;
 pub mod solution;
 pub mod solve;
